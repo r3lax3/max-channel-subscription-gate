@@ -26,14 +26,25 @@ async def run_polling(
     session_factory: async_sessionmaker[AsyncSession],
     update_types: list[str],
 ) -> None:
-    """Long polling. marker храним в БД, чтобы после рестарта не терять события."""
-    for sub in await client.get_subscriptions():
-        # При активной webhook-подписке /updates молчит.
-        logger.warning("Removing webhook subscription %s to use long polling", sub.get("url"))
-        await client.unsubscribe(sub["url"])
+    """Long polling. marker храним в БД, чтобы после рестарта не терять события.
 
-    async with session_factory() as session:
-        raw = await UnitOfWork(session).state.get(MARKER_KEY)
+    Пачку событий обрабатываем параллельно (порядок событий одного
+    пользователя держит GateBot) и сдвигаем marker только после всей пачки.
+    """
+    while True:
+        try:
+            for sub in await client.get_subscriptions():
+                # При активной webhook-подписке /updates молчит.
+                logger.warning("Removing webhook subscription %s to use long polling", sub.get("url"))
+                await client.unsubscribe(sub["url"])
+            async with session_factory() as session:
+                raw = await UnitOfWork(session).state.get(MARKER_KEY)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Long polling setup failed, retrying")
+            await asyncio.sleep(10)
     marker = int(raw) if raw else None
     logger.info("Long polling started (marker=%s)", marker)
 
@@ -46,15 +57,19 @@ async def run_polling(
             logger.exception("get_updates failed")
             await asyncio.sleep(5)
             continue
-        for update in data.get("updates", []):
-            await handle(update)
+        updates = data.get("updates") or []
+        if updates:
+            await asyncio.gather(*(handle(u) for u in updates))
         new_marker = data.get("marker")
         if new_marker is not None and new_marker != marker:
             marker = new_marker
-            async with session_factory() as session:
-                uow = UnitOfWork(session)
-                await uow.state.set(MARKER_KEY, str(marker))
-                await uow.commit()
+            try:
+                async with session_factory() as session:
+                    uow = UnitOfWork(session)
+                    await uow.state.set(MARKER_KEY, str(marker))
+                    await uow.commit()
+            except Exception:
+                logger.exception("Failed to persist polling marker")
 
 
 class _Deduplicator:
@@ -85,9 +100,19 @@ def update_key(update: dict) -> str:
 
 
 def add_webhook_route(app: web.Application, secret: str, handle: UpdateHandler) -> None:
-    """POST /max/webhook. Отвечаем сразу, событие обрабатываем в фоне (лимит MAX — 30 с)."""
+    """POST /max/webhook. Отвечаем сразу, событие обрабатываем в фоне (лимит MAX — 30 с).
+
+    При остановке сервера ждём уже принятые события: MAX получил 200 и не повторит их.
+    """
     dedup = _Deduplicator()
     tasks: set[asyncio.Task] = set()
+
+    async def drain(app: web.Application) -> None:
+        if tasks:
+            logger.info("Waiting for %d webhook updates to finish", len(tasks))
+            await asyncio.wait(tasks, timeout=25)
+
+    app.on_shutdown.append(drain)
 
     async def max_webhook(request: web.Request) -> web.Response:
         got = request.headers.get("X-Max-Bot-Api-Secret", "")

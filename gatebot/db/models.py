@@ -1,6 +1,8 @@
 from datetime import datetime
 
 from sqlalchemy import BigInteger, ForeignKey, String, func
+
+from core.utils import utcnow
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -20,7 +22,7 @@ class User(Base):
     expiring_notice_sent: Mapped[bool] = mapped_column(default=False, server_default="false")
     # Право на цену «старичка»; сбрасывается навсегда при разрыве подписки
     legacy_pricing: Mapped[bool] = mapped_column(default=False, server_default="false")
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, server_default=func.now())
 
     payments: Mapped[list["Payment"]] = relationship(back_populates="user")
 
@@ -36,7 +38,7 @@ class Payment(Base):
     amount: Mapped[int] = mapped_column()
     days: Mapped[int] = mapped_column(default=30, server_default="30")
     status: Mapped[str] = mapped_column(String(20), default="pending")
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="payments")
 

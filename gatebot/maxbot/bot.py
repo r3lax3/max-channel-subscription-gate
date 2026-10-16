@@ -1,8 +1,9 @@
 """Обработка событий MAX: меню пользователя, оплата, контроль входа, админка."""
 import asyncio
 import logging
+import weakref
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -22,6 +23,8 @@ from maxbot.client import MaxClient
 from maxbot.messenger import MaxMessenger
 
 logger = logging.getLogger(__name__)
+
+MSK = timezone(timedelta(hours=3))
 
 UPDATE_TYPES = [
     "bot_started", "message_created", "message_callback",
@@ -58,6 +61,8 @@ class GateBot:
         self.admin_states: dict[int, AdminState] = {}
         self._chat_links: dict[int, str] = {}
         self._background: set[asyncio.Task] = set()
+        # Слабые ссылки: замок живёт, пока его кто-то держит или ждёт.
+        self._locks: weakref.WeakValueDictionary[object, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def is_owner(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.settings.owner_ids
@@ -73,8 +78,15 @@ class GateBot:
         }.get(update.get("update_type", ""))
         if handler is None:
             return
+        # События одного пользователя — строго по очереди (ввод админа, затем
+        # нажатие кнопки), разных пользователей — параллельно.
+        key = _update_owner(update)
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = self._locks[key] = asyncio.Lock()
         try:
-            await handler(update)
+            async with lock:
+                await handler(update)
         except Exception:
             logger.exception("Failed to handle %s", update.get("update_type"))
 
@@ -226,7 +238,12 @@ class GateBot:
                 logger.info("User %s joined %s with active subscription", user_id, chat_id)
                 return
         logger.info("User %s joined %s without subscription — removing", user_id, chat_id)
-        await self.messenger.remove_member(chat_id, user_id)
+        try:
+            await self.messenger.remove_member(chat_id, user_id)
+        except Exception:
+            logger.exception("Failed to remove stranger %s from %s", user_id, chat_id)
+            await self._alert_owners(texts.STRANGER_KICK_FAILED.format(user_id=user_id))
+            return
         try:
             await self.messenger.send_text(user_id, texts.JOIN_DENIED)
         except Exception:
@@ -249,16 +266,22 @@ class GateBot:
         if update.get("is_channel"):
             note += "\n⚠️ Удалять подписчиков канала бот в MAX не может — закрыть можно только групповой чат."
         logger.info("Bot added to %s %s (%s)", kind, chat_id, title)
+        await self._alert_owners(
+            f"Бота добавили в {kind} «{ui.plain(title)}».\nchat_id: `{chat_id}`\n{note}"
+        )
+
+    async def _alert_owners(self, text: str) -> None:
         for owner_id in self.settings.owner_ids:
             try:
-                await self.messenger.send_text(
-                    owner_id, f"Бота добавили в {kind} «{title}».\nchat_id: `{chat_id}`\n{note}"
-                )
+                await self.messenger.send_text(owner_id, text)
             except Exception:
-                logger.info("Could not notify owner %s", owner_id)
+                logger.warning("Could not notify owner %s", owner_id, exc_info=True)
 
     async def on_bot_removed(self, update: dict) -> None:
-        logger.warning("Bot removed from chat %s", update.get("chat_id"))
+        chat_id = update.get("chat_id")
+        logger.warning("Bot removed from chat %s", chat_id)
+        if chat_id in self.settings.gated_chat_ids:
+            await self._alert_owners(texts.BOT_REMOVED_FROM_CLUB.format(chat_id=chat_id))
 
     # ---------- админка ----------
 
@@ -290,6 +313,18 @@ class GateBot:
         if action == "users":
             state.waiting = "search"
             return ui.admin_prompt(texts.ADMIN_USER_PROMPT), None
+        if action.startswith("create:"):
+            # Карточку по MAX ID заводят заранее — чтобы выдать доступ «своим»
+            # до того, как они запустят бота.
+            max_id = _parse_max_id(action.removeprefix("create:"))
+            if max_id is None:
+                return ui.admin_menu(), texts.ADMIN_USER_NOT_FOUND
+            async with self.session_factory() as session:
+                uow = UnitOfWork(session)
+                await uow.users.get_or_create(max_id)
+                await uow.commit()
+                state.selected_max_id, state.waiting = max_id, None
+                return await self._user_card(uow, max_id), None
         if action == "stats":
             state.waiting = None
             async with self.session_factory() as session:
@@ -331,6 +366,11 @@ class GateBot:
             if not text and not images:
                 await self.send(admin_id, ui.admin_broadcast(state.have_broadcast))
                 return
+            if len(text) > ui.MAX_TEXT_LENGTH:
+                await self.send(admin_id, ui.admin_prompt(
+                    texts.ADMIN_BROADCAST_TOO_LONG.format(limit=ui.MAX_TEXT_LENGTH, length=len(text))
+                ))
+                return
             state.broadcast_text, state.broadcast_images = text or None, images
             await self.send(admin_id, ui.admin_broadcast(True))
             return
@@ -340,9 +380,10 @@ class GateBot:
             if state.waiting == "search":
                 user = await _find_user(uow, text)
                 if user is None:
-                    await self.send(admin_id, ui.admin_prompt(texts.ADMIN_USER_NOT_FOUND))
+                    max_id = _parse_max_id(text)
+                    await self.send(admin_id, ui.admin_user_missing(max_id) if max_id else
+                                    ui.admin_prompt(texts.ADMIN_USER_NOT_FOUND))
                     return
-                await uow.commit()
                 state.selected_max_id = user.max_user_id
                 state.waiting = None
                 await self.send(admin_id, await self._user_card(uow, user.max_user_id))
@@ -350,16 +391,16 @@ class GateBot:
 
             if state.waiting == "extend":
                 try:
-                    new_date = datetime.strptime(text, "%Y-%m-%d")
+                    day = datetime.strptime(text, "%Y-%m-%d").date()
                 except ValueError:
                     await self.send(admin_id, ui.admin_prompt(texts.ADMIN_EXTEND_BAD_DATE))
                     return
                 service = SubscriptionService(uow, self.messenger, self.settings)
-                await service.set_end_date(state.selected_max_id, new_date)
+                user = await service.set_end_date(state.selected_max_id, end_of_day_msk(day))
                 state.waiting = None
-                await self.messenger.send_text(
-                    admin_id, texts.ADMIN_EXTEND_DONE.format(date=new_date.strftime("%Y-%m-%d"))
-                )
+                done = (texts.ADMIN_EXTEND_DONE.format(date=day.strftime("%d.%m.%Y"))
+                        if user else texts.ADMIN_REVOKE_FAILED)
+                await self.messenger.send_text(admin_id, done)
                 await self.send(admin_id, await self._user_card(uow, state.selected_max_id))
 
     async def _user_card(self, uow: UnitOfWork, max_user_id: int) -> dict:
@@ -402,15 +443,44 @@ class GateBot:
             logger.warning("Failed to report broadcast result to %s", admin_id, exc_info=True)
 
 
-async def _find_user(uow: UnitOfWork, query: str) -> User | None:
-    query = query.strip()
-    if not query:
+_INT64_MAX = 2**63 - 1
+
+
+def _parse_max_id(text: str) -> int | None:
+    text = text.strip()
+    if not (text.isascii() and text.isdigit()):
         return None
-    if query.lstrip("-").isdigit():
-        # По MAX ID карточку можно завести заранее — например, чтобы выдать
-        # доступ «своим» до того, как они запустят бота.
-        return await uow.users.get_or_create(int(query))
+    value = int(text)
+    return value if 0 < value <= _INT64_MAX else None
+
+
+async def _find_user(uow: UnitOfWork, query: str) -> User | None:
+    max_id = _parse_max_id(query)
+    if max_id is not None:
+        return await uow.users.get_by_max_id(max_id)
+    query = query.strip()
+    if not query or len(query) > 255:
+        return None
     return await uow.users.get_by_username(query)
+
+
+def end_of_day_msk(day: date) -> datetime:
+    """Конец указанного дня по Москве — в naive UTC, как хранится в БД."""
+    return (
+        datetime.combine(day, time(23, 59, 59), tzinfo=MSK)
+        .astimezone(timezone.utc)
+        .replace(tzinfo=None)
+    )
+
+
+def _update_owner(update: dict) -> object:
+    for path in (("callback", "user"), ("message", "sender"), ("user",)):
+        node: Any = update
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict) and node.get("user_id") is not None:
+            return node["user_id"]
+    return ("chat", update.get("chat_id"))
 
 
 def _broadcast_body(state: AdminState) -> dict[str, Any]:

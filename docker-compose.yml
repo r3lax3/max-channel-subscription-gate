@@ -17,7 +17,8 @@ services:
 
   bot:
     build:
-      context: ./gatebot
+      context: .
+      dockerfile: gatebot/Dockerfile
     container_name: maxgate
     restart: unless-stopped
     depends_on:

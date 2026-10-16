@@ -5,6 +5,15 @@ import texts
 from core.pricing import TARIFFS, Tariff
 
 
+MAX_TEXT_LENGTH = 4000
+_MARKUP_CHARS = str.maketrans("", "", "*_~+^`[]()#>\\")
+
+
+def plain(value: str | None, limit: int = 64) -> str:
+    """Чужой текст (имя, название чата) без символов разметки — чтобы не сломать markdown."""
+    return (value or "").translate(_MARKUP_CHARS).strip()[:limit]
+
+
 def screen(text: str, rows: list[list[dict]] | None = None) -> dict:
     body: dict = {"text": text, "format": "markdown"}
     body["attachments"] = (
@@ -33,7 +42,7 @@ def fmt_date(value: datetime | None) -> str:
 
 def main_menu(first_name: str, price_month: int, support_link: str) -> dict:
     return screen(
-        texts.WELCOME.format(first_name=first_name or "Здравствуйте", price_month=price_month),
+        texts.WELCOME.format(first_name=plain(first_name) or "Здравствуйте", price_month=price_month),
         [[cb(texts.BTN_PAY, "pay")], *_support_row(support_link)],
     )
 
@@ -123,6 +132,14 @@ def admin_user_card(card: str, legacy_pricing: bool) -> dict:
         [cb(texts.BTN_ADMIN_EXTEND, "adm:extend")],
         [cb(texts.BTN_ADMIN_REVOKE, "adm:revoke")],
         [cb(texts.BTN_ADMIN_LEGACY_OFF if legacy_pricing else texts.BTN_ADMIN_LEGACY_ON, "adm:legacy")],
+        [cb(texts.BTN_ADMIN_FIND_ANOTHER, "adm:users")],
+        admin_back_row(),
+    ])
+
+
+def admin_user_missing(max_id: int) -> dict:
+    return screen(texts.ADMIN_USER_MISSING.format(max_user_id=max_id), [
+        [cb(texts.BTN_ADMIN_CREATE, f"adm:create:{max_id}")],
         [cb(texts.BTN_ADMIN_FIND_ANOTHER, "adm:users")],
         admin_back_row(),
     ])

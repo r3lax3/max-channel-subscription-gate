@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 
 from pydantic import field_validator
@@ -60,7 +61,19 @@ class Settings(BaseSettings):
 
     prodamus_domain: str = ""
     prodamus_secret_key: str = ""
-    # Публичный URL вебхука этого бота: https://<домен>/prodamus/webhook
+    # Публичный URL вебхука этого бота (https://<домен>/.../prodamus/webhook).
+    # Его же нужно добавить в кабинете Prodamus: «Настройки → URL для уведомлений».
     prodamus_notification_url: str = ""
 
     webhook_port: int = 8080
+
+    def problems(self) -> list[str]:
+        """Ошибки конфигурации, с которыми бот работать не может."""
+        errors = []
+        if not self.prodamus_domain or not self.prodamus_secret_key:
+            errors.append("prodamus_domain и prodamus_secret_key обязательны: без них нет оплат")
+        if self.max_webhook_url and not re.fullmatch(r"[A-Za-z0-9_-]{5,256}", self.max_webhook_secret):
+            errors.append("max_webhook_secret обязателен при max_webhook_url (5–256 символов [A-Za-z0-9_-])")
+        if self.max_webhook_url and not self.max_webhook_url.startswith("https://"):
+            errors.append("max_webhook_url должен быть https:// на 443-м порту")
+        return errors

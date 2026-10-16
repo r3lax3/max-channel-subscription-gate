@@ -54,7 +54,7 @@ async def _create_order(session_factory, links, max_user_id=10) -> int:
 
 async def test_paid_webhook_activates_subscription(client, session_factory, links):
     order_id = await _create_order(session_factory, links)
-    form = {"order_id": str(order_id), "payment_status": "success"}
+    form = {"order_num": str(order_id), "order_id": "777", "payment_status": "success", "sum": "2000.00", "customer_extra": "max:10"}
     resp = await client.post("/prodamus/webhook", data=form, headers={"Sign": _create_hmac(form, SECRET)})
     assert resp.status == 200
     assert client.activated == [10]
@@ -67,7 +67,7 @@ async def test_paid_webhook_activates_subscription(client, session_factory, link
 
 async def test_bad_signature_is_rejected(client, session_factory, links):
     order_id = await _create_order(session_factory, links)
-    form = {"order_id": str(order_id), "payment_status": "success"}
+    form = {"order_num": str(order_id), "order_id": "777", "payment_status": "success", "sum": "2000.00", "customer_extra": "max:10"}
     resp = await client.post("/prodamus/webhook", data=form, headers={"Sign": "deadbeef"})
     assert resp.status == 403
     assert client.activated == []
@@ -75,7 +75,7 @@ async def test_bad_signature_is_rejected(client, session_factory, links):
 
 async def test_repeated_webhook_activates_once(client, session_factory, links):
     order_id = await _create_order(session_factory, links)
-    form = {"order_id": str(order_id), "payment_status": "success"}
+    form = {"order_num": str(order_id), "order_id": "777", "payment_status": "success", "sum": "2000.00", "customer_extra": "max:10"}
     headers = {"Sign": _create_hmac(form, SECRET)}
     await client.post("/prodamus/webhook", data=form, headers=headers)
     await client.post("/prodamus/webhook", data=form, headers=headers)
@@ -84,3 +84,23 @@ async def test_repeated_webhook_activates_once(client, session_factory, links):
 
 async def test_health(client):
     assert (await client.get("/health")).status == 200
+
+
+async def test_unmatched_payment_alerts_owner(client, messenger):
+    form = {"order_num": "1", "payment_status": "success", "sum": "5.00", "customer_extra": "max:10"}
+    resp = await client.post("/prodamus/webhook", data=form, headers={"Sign": _create_hmac(form, SECRET)})
+    assert resp.status == 200
+    assert [uid for uid, _ in messenger.sent] == [1]
+
+
+async def test_foreign_payment_is_silently_ignored(client, messenger):
+    form = {"order_num": "1", "payment_status": "success", "sum": "5.00", "customer_extra": "12345"}
+    resp = await client.post("/prodamus/webhook", data=form, headers={"Sign": _create_hmac(form, SECRET)})
+    assert resp.status == 200 and messenger.sent == []
+
+
+def test_signature_list_detection_like_php():
+    from infrastructure.prodamus import _unflatten
+
+    form = {f"products[{i}][name]": str(i) for i in (1, 0, 10, 2, 3, 4, 5, 6, 7, 8, 9)}
+    assert [p["name"] for p in _unflatten(form)["products"]] == [str(i) for i in range(11)]

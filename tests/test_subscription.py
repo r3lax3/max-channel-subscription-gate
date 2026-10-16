@@ -7,24 +7,23 @@ from .conftest import CHANNEL_ID, GROUP_ID, make_user
 
 
 async def test_activate_new_user_starts_from_now(uow, messenger, settings):
-    user = await make_user(uow, 10)
-    await SubscriptionService(uow, messenger, settings).activate(user, 30)
+    await make_user(uow, 10)
+    user = await SubscriptionService(uow, messenger, settings).activate(10, 30)
     assert user.is_active
     assert abs(user.subscription_end_date - (utcnow() + timedelta(days=30))) < timedelta(minutes=1)
 
 
 async def test_activate_extends_active_subscription(uow, messenger, settings):
-    user = await make_user(uow, 10, days_left=5, expiring_notice_sent=True)
-    end = user.subscription_end_date
-    await SubscriptionService(uow, messenger, settings).activate(user, 30)
+    end = (await make_user(uow, 10, days_left=5, expiring_notice_sent=True)).subscription_end_date
+    user = await SubscriptionService(uow, messenger, settings).activate(10, 30)
     assert user.subscription_end_date == end + timedelta(days=30)
     assert user.expiring_notice_sent is False
 
 
 async def test_activate_during_promo_grants_legacy(uow, messenger, settings):
     settings.legacy_promo_until = utcnow() + timedelta(days=1)
-    user = await make_user(uow, 10)
-    await SubscriptionService(uow, messenger, settings).activate(user, 30)
+    await make_user(uow, 10)
+    user = await SubscriptionService(uow, messenger, settings).activate(10, 30)
     assert user.legacy_pricing
 
 
@@ -62,4 +61,18 @@ async def test_set_end_date_in_future_activates(uow, messenger, settings):
         10, utcnow() + timedelta(days=10)
     )
     assert SubscriptionService.has_active_subscription(user)
+    assert messenger.removed == []
+
+
+async def test_set_end_date_in_past_keeps_state_when_kick_fails(uow, messenger, settings):
+    await make_user(uow, 10, days_left=5)
+    messenger.fail_remove_for.add(10)
+    service = SubscriptionService(uow, messenger, settings)
+    assert await service.set_end_date(10, utcnow() - timedelta(days=1)) is None
+    assert SubscriptionService.has_active_subscription(await uow.users.get_by_max_id(10))
+
+
+async def test_expire_skips_user_renewed_meanwhile(uow, messenger, settings):
+    await make_user(uow, 10, days_left=10)
+    assert await SubscriptionService(uow, messenger, settings).expire_if_due(10) is None
     assert messenger.removed == []

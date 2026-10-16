@@ -3,6 +3,7 @@
 Только нужные боту методы. Ответы — dict, как в API. Ошибки — MaxApiError.
 """
 import asyncio
+import json as _json
 import logging
 import ssl
 from pathlib import Path
@@ -77,6 +78,7 @@ class MaxClient:
     ) -> dict:
         params = {k: _query_value(v) for k, v in (params or {}).items() if v is not None}
         session = await self._get_session()
+        idempotent = method != "POST"
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             await self._throttle()
             try:
@@ -84,19 +86,32 @@ class MaxClient:
                     method, path, params=params, json=json,
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as resp:
-                    data = await resp.json(content_type=None) if resp.content_length != 0 else {}
-                    if resp.status in _RETRY_STATUSES and attempt < _MAX_ATTEMPTS:
-                        await asyncio.sleep(attempt)
-                        continue
-                    if resp.status >= 400:
-                        data = data or {}
-                        raise MaxApiError(resp.status, data.get("code", ""), data.get("message", ""))
-                    return data or {}
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
-                if attempt == _MAX_ATTEMPTS:
+                    status = resp.status
+                    raw = await resp.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # POST не идемпотентен: повторяем, только если запрос точно не ушёл
+                # (не удалось соединиться), иначе рискуем отправить сообщение дважды.
+                retryable = idempotent or isinstance(exc, aiohttp.ClientConnectorError)
+                if attempt == _MAX_ATTEMPTS or not retryable:
                     raise
                 logger.warning("MAX %s %s: network error, retry %d", method, path, attempt)
                 await asyncio.sleep(attempt)
+                continue
+
+            retryable = status == 429 or (idempotent and status in _RETRY_STATUSES)
+            if retryable and attempt < _MAX_ATTEMPTS:
+                logger.warning("MAX %s %s: HTTP %s, retry %d", method, path, status, attempt)
+                await asyncio.sleep(attempt * 2)
+                continue
+            try:
+                data = _json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                # Например, HTML-страница 502 от балансировщика.
+                raise MaxApiError(status, "bad.response", raw[:200]) from None
+            if status >= 400:
+                data = data if isinstance(data, dict) else {}
+                raise MaxApiError(status, data.get("code", ""), data.get("message", ""))
+            return data if isinstance(data, dict) else {"result": data}
         raise AssertionError("unreachable")
 
     @staticmethod

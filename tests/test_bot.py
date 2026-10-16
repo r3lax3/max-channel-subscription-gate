@@ -177,13 +177,16 @@ async def test_admin_extend_and_revoke(bot, client, session_factory):
     await bot.handle_update(dm(OWNER, "/admin"))
     await bot.handle_update(callback(OWNER, "adm:users"))
     await bot.handle_update(dm(OWNER, "55"))
-    assert "MAX ID: 55" in client.texts_to(OWNER)[-1]
+    assert "ещё не запускал" in client.texts_to(OWNER)[-1]
+    await bot.handle_update(callback(OWNER, "adm:create:55"))
+    assert "MAX ID: 55" in client.answers[-1]["message"]["text"]
 
     await bot.handle_update(callback(OWNER, "adm:extend"))
     await bot.handle_update(dm(OWNER, "2099-01-01"))
     async with session_factory() as session:
         u = await UnitOfWork(session).users.get_by_max_id(55)
-        assert u.is_active and u.subscription_end_date.year == 2099
+        # Конец дня по Москве = 20:59:59 UTC
+        assert u.is_active and str(u.subscription_end_date) == "2099-01-01 20:59:59"
 
     await bot.handle_update(callback(OWNER, "adm:revoke"))
     assert client.removed == [(GROUP_ID, 55)]
@@ -191,7 +194,8 @@ async def test_admin_extend_and_revoke(bot, client, session_factory):
         assert not (await UnitOfWork(session).users.get_by_max_id(55)).is_active
 
 
-async def test_admin_bad_date(bot, client):
+async def test_admin_bad_date(bot, client, uow):
+    await make_user(uow, 55)
     await bot.handle_update(callback(OWNER, "adm:users"))
     await bot.handle_update(dm(OWNER, "55"))
     await bot.handle_update(callback(OWNER, "adm:extend"))
@@ -221,3 +225,35 @@ async def test_bot_added_notifies_owner(bot, client):
                              "user": user(OWNER)})
     text = client.texts_to(OWNER)[-1]
     assert "-555" in text and "канал" in text
+
+
+@pytest.mark.parametrize("query", ["99999999999999999999999", "²", "-5", "@nobody"])
+async def test_admin_search_rejects_garbage(bot, client, session_factory, query):
+    await bot.handle_update(callback(OWNER, "adm:users"))
+    await bot.handle_update(dm(OWNER, query))
+    assert "не найден" in client.texts_to(OWNER)[-1]
+    async with session_factory() as session:
+        assert await UnitOfWork(session).users.count_total() == 0
+
+
+async def test_broadcast_too_long_is_rejected(bot, client):
+    await bot.handle_update(callback(OWNER, "adm:bc"))
+    await bot.handle_update(dm(OWNER, "x" * 4001))
+    assert "Слишком длинный" in client.texts_to(OWNER)[-1]
+
+
+async def test_stranger_kick_failure_alerts_owner(bot, client):
+    async def broken(chat_id, user_id, block=False):
+        raise MaxApiError(500, "", "boom")
+
+    client.remove_member = broken
+    client.members[GROUP_ID] = [77]
+    await bot.handle_update({"update_type": "user_added", "chat_id": GROUP_ID,
+                             "user": user(77), "inviter_id": None, "is_channel": False})
+    assert "77" in client.texts_to(OWNER)[-1]
+
+
+async def test_markup_in_name_is_stripped(bot, client):
+    await bot.handle_update({"update_type": "bot_started", "chat_id": 5,
+                             "user": user(10, name="*Ann_[x](y)")})
+    assert client.sent[-1][1]["text"].startswith("Annxy,")

@@ -24,56 +24,56 @@ async def run_worker_cycle(
     """Один проход: напомнить об окончании, исключить истёкших, протухить старые платежи."""
     async with session_factory() as session:
         uow = UnitOfWork(session)
-        service = SubscriptionService(uow, messenger, settings)
-
+        # Флаг ставим до отправки и при ошибке не снимаем: человек мог остановить
+        # бота, и без флага мы бы писали ему каждый час до конца подписки.
+        expiring_ids = await uow.users.claim_expiring_notices(EXPIRING_NOTICE_DAYS)
+        await uow.commit()
         notified = 0
-        for user in await uow.users.get_expiring_unnotified(EXPIRING_NOTICE_DAYS):
-            # Флаг ставим и при ошибке: человек мог остановить бота, и без флага
-            # мы бы пытались ему писать каждый час до конца подписки.
-            user.expiring_notice_sent = True
+        for max_user_id in expiring_ids:
             try:
                 await messenger.send_text(
-                    user.max_user_id, SUBSCRIPTION_EXPIRING.format(days=EXPIRING_NOTICE_DAYS)
+                    max_user_id, SUBSCRIPTION_EXPIRING.format(days=EXPIRING_NOTICE_DAYS)
                 )
                 notified += 1
             except Exception:
-                logger.warning("Failed to notify expiring user %s", user.max_user_id, exc_info=True)
-        await uow.commit()
-
-        kicked = 0
-        kick_failed: list[int] = []
-        for user in await uow.users.get_expired():
-            if not await service.kick(user.max_user_id):
-                kick_failed.append(user.max_user_id)
-                continue
-            user.is_active = False
-            user.expiring_notice_sent = False
-            user.legacy_pricing = False
-            kicked += 1
-            await uow.commit()
-            try:
-                await messenger.send_text(user.max_user_id, SUBSCRIPTION_EXPIRED)
-            except Exception:
-                logger.warning("Failed to send expiry message to %s", user.max_user_id, exc_info=True)
-
-        if kick_failed:
-            # Скорее всего бот потерял права админа — без вмешательства человека
-            # истёкшие подписчики так и останутся в клубе.
-            await _alert_owners(
-                messenger, settings,
-                KICK_FAILED_ALERT.format(count=len(kick_failed), ids=", ".join(map(str, kick_failed))),
-            )
-
+                logger.warning("Failed to notify expiring user %s", max_user_id, exc_info=True)
         stale = await uow.payments.expire_stale_pending(PENDING_PAYMENT_TTL_HOURS)
         await uow.commit()
+        expired_ids = await uow.users.get_expired_ids()
 
-        strangers = 0
-        if settings.reconcile_members:
-            strangers = await _remove_strangers(uow, messenger, settings)
-        logger.info(
-            "Worker cycle: notified=%d, kicked=%d, expired_payments=%d, strangers=%d",
-            notified, kicked, stale, strangers,
+    kicked = 0
+    kick_failed: list[int] = []
+    for max_user_id in expired_ids:
+        # Своя транзакция на каждого: блокировка строки держится только на время кика.
+        async with session_factory() as session:
+            result = await SubscriptionService(
+                UnitOfWork(session), messenger, settings
+            ).expire_if_due(max_user_id)
+        if result is False:
+            kick_failed.append(max_user_id)
+        elif result:
+            kicked += 1
+            try:
+                await messenger.send_text(max_user_id, SUBSCRIPTION_EXPIRED)
+            except Exception:
+                logger.warning("Failed to send expiry message to %s", max_user_id, exc_info=True)
+
+    if kick_failed:
+        # Скорее всего бот потерял права админа — без вмешательства человека
+        # истёкшие подписчики так и останутся в клубе.
+        await _alert_owners(
+            messenger, settings,
+            KICK_FAILED_ALERT.format(count=len(kick_failed), ids=", ".join(map(str, kick_failed))),
         )
+
+    strangers = 0
+    if settings.reconcile_members:
+        async with session_factory() as session:
+            strangers = await _remove_strangers(UnitOfWork(session), messenger, settings)
+    logger.info(
+        "Worker cycle: notified=%d, kicked=%d, expired_payments=%d, strangers=%d",
+        notified, kicked, stale, strangers,
+    )
 
 
 async def _alert_owners(messenger: Messenger, settings: Settings, text: str) -> None:

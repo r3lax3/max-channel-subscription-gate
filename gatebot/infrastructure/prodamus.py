@@ -31,7 +31,8 @@ class ProdamusClient:
         customer_extra: str,
         product_name: str,
     ) -> str:
-        expires_at = utcnow() + timedelta(hours=LINK_EXPIRATION_HOURS)
+        # Prodamus трактует время как московское.
+        expires_at = utcnow() + timedelta(hours=3 + LINK_EXPIRATION_HOURS)
 
         params = {
             "do": "link",
@@ -51,8 +52,8 @@ class ProdamusClient:
             "sys": "",
         }
         if self.notification_url:
-            # Вебхук именно этого бота, а не тот, что задан в кабинете Prodamus
-            # (кабинет может быть общим с TG-ботом).
+            # Prodamus учитывает его не во всех интеграциях — основной способ
+            # доставки уведомлений: URL в кабинете (см. docs/adr/0003).
             params["urlNotification"] = self.notification_url
 
         signature = _create_hmac(params, self.secret)
@@ -79,7 +80,7 @@ def _create_hmac(data: dict, key: str) -> str:
         normalized,
         separators=(",", ":"),
         ensure_ascii=False,
-    ).replace("/", "\\/")
+    ).replace("/", "\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     return hmac.new(
         key.encode("utf-8"),
         data_str.encode("utf-8"),
@@ -142,7 +143,8 @@ def _dicts_to_lists(node):
     if not isinstance(node, dict):
         return node
     converted = {k: _dicts_to_lists(v) for k, v in node.items()}
-    keys = list(converted)
-    if keys and keys == [str(i) for i in range(len(keys))]:
-        return [converted[k] for k in keys]
+    # Как PHP: массив с ключами 0..n-1 (в любом порядке) — это список.
+    if converted and all(k.isdigit() for k in converted) and \
+            sorted(int(k) for k in converted) == list(range(len(converted))):
+        return [converted[str(i)] for i in range(len(converted))]
     return converted

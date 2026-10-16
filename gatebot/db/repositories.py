@@ -21,6 +21,20 @@ class UserRepository:
         )
         return result.scalar_one_or_none()
 
+    async def lock(self, max_user_id: int) -> User | None:
+        """SELECT ... FOR UPDATE со свежими данными из БД.
+
+        Все изменения подписки идут под этой блокировкой: вебхук оплаты,
+        воркер и админка не перетирают изменения друг друга.
+        """
+        result = await self.session.execute(
+            select(User)
+            .where(User.max_user_id == max_user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_username(self, username: str) -> User | None:
         normalized = username.lstrip("@")
         if not normalized:
@@ -66,18 +80,34 @@ class UserRepository:
             User.subscription_end_date <= now + timedelta(days=days_ahead),
         )
 
-    async def get_expiring_unnotified(self, days_ahead: int) -> list[User]:
-        result = await self.session.execute(
-            select(User).where(
+    async def claim_expiring_notices(self, days_ahead: int) -> list[int]:
+        """Помечает «напоминание отправлено» у истекающих и возвращает их MAX ID.
+
+        Одним UPDATE: параллельное продление (сбрасывает флаг) не перетирается.
+        """
+        ids = list((await self.session.execute(
+            select(User.id).where(
                 *self._expiring_filter(days_ahead),
                 User.expiring_notice_sent.is_(False),
             )
+        )).scalars().all())
+        if not ids:
+            return []
+        result = await self.session.execute(
+            update(User)
+            .where(
+                User.id.in_(ids),
+                *self._expiring_filter(days_ahead),
+                User.expiring_notice_sent.is_(False),
+            )
+            .values(expiring_notice_sent=True)
+            .returning(User.max_user_id)
         )
         return list(result.scalars().all())
 
-    async def get_expired(self) -> list[User]:
+    async def get_expired_ids(self) -> list[int]:
         result = await self.session.execute(
-            select(User).where(
+            select(User.max_user_id).where(
                 User.is_active.is_(True),
                 User.subscription_end_date.isnot(None),
                 User.subscription_end_date <= utcnow(),
@@ -118,14 +148,23 @@ class PaymentRepository:
     async def get_by_order_id(self, order_id: int) -> Payment | None:
         return await self.session.get(Payment, order_id)
 
-    async def get_latest_pending_by_user_id(self, user_id: int) -> Payment | None:
+    async def claim_paid(self, payment_id: int) -> bool:
+        """Атомарно переводит платёж в success. False — уже был оплачен (повтор вебхука)."""
+        result = await self.session.execute(
+            update(Payment)
+            .where(Payment.id == payment_id, Payment.status != "success")
+            .values(status="success")
+        )
+        return result.rowcount == 1
+
+    async def get_unpaid_by_user_id(self, user_id: int) -> list[Payment]:
+        """Неоплаченные платежи пользователя (pending и протухшие), новые первыми."""
         result = await self.session.execute(
             select(Payment)
-            .where(Payment.user_id == user_id, Payment.status == "pending")
-            .order_by(Payment.created_at.desc())
-            .limit(1)
+            .where(Payment.user_id == user_id, Payment.status != "success")
+            .order_by(Payment.created_at.desc(), Payment.id.desc())
         )
-        return result.scalar_one_or_none()
+        return list(result.scalars().all())
 
     async def count_by_status(self, status: str) -> int:
         result = await self.session.execute(
