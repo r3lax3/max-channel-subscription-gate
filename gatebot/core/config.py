@@ -22,8 +22,19 @@ class Settings(BaseSettings):
     # Ссылка на бота в MAX (https://max.ru/<bot_username>) — возврат после оплаты
     bot_link: str = ""
 
-    # Закрытые чаты (группа и/или канал), куда пускаем только с подпиской
+    # Закрытые групповые чаты, куда пускаем только с подпиской. Только группы:
+    # удалять подписчиков канала бот в MAX не может (см. docs/adr/0001).
     gated_chat_ids: list[int] = []
+    # Ссылки-приглашения, которые бот выдаёт оплатившим. Пусто — бот возьмёт
+    # ссылку из настроек чата (Chat.link).
+    invite_links: list[str] = []
+    # Сверять участников закрытых чатов с базой и удалять неоплативших
+    # (страховка от пропущенных событий). Включать, когда все свои уже в базе.
+    reconcile_members: bool = False
+
+    # Webhook MAX: публичный HTTPS-URL на порту 443. Пусто — long polling.
+    max_webhook_url: str = ""
+    max_webhook_secret: str = ""
 
     # Базовая цена руб/месяц; цены тарифов (квартал, полгода) считаются от неё
     subscription_price: int = 2000
@@ -49,5 +60,7 @@ class Settings(BaseSettings):
 
     prodamus_domain: str = ""
     prodamus_secret_key: str = ""
+    # Публичный URL вебхука этого бота: https://<домен>/prodamus/webhook
+    prodamus_notification_url: str = ""
 
     webhook_port: int = 8080

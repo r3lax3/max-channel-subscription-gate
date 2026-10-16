@@ -10,6 +10,9 @@ from db.uow import UnitOfWork
 logger = logging.getLogger(__name__)
 
 _MAX_ORDER_ID_RETRIES = 5
+# Префикс customer_extra: отличает наши платежи от платежей TG-бота на том же
+# аккаунте Prodamus (тот ждёт там голый telegram_id и наш просто проигнорирует).
+CUSTOMER_EXTRA_PREFIX = "max:"
 
 
 class PaymentService:
@@ -45,7 +48,7 @@ class PaymentService:
         link = await self.links.create_payment_link(
             order_id=order_id,
             amount=amount,
-            customer_extra=max_user_id,
+            customer_extra=f"{CUSTOMER_EXTRA_PREFIX}{max_user_id}",
             product_name=product_name,
         )
         logger.info("Payment link created for %s, order %s", max_user_id, order_id)
@@ -75,11 +78,11 @@ class PaymentService:
                 logger.warning("Webhook: invalid order_id=%r", order_id_raw)
 
         # Prodamus `order_num` — их внутренний счётчик. Если нашего order_id нет,
-        # ищем последний ожидающий платёж пользователя по customer_extra (MAX user_id).
-        if payment is None and customer_extra_raw:
+        # ищем последний ожидающий платёж пользователя по customer_extra ("max:<id>").
+        if payment is None and str(customer_extra_raw or "").startswith(CUSTOMER_EXTRA_PREFIX):
             try:
-                max_user_id = int(customer_extra_raw)
-            except (TypeError, ValueError):
+                max_user_id = int(str(customer_extra_raw).removeprefix(CUSTOMER_EXTRA_PREFIX))
+            except ValueError:
                 max_user_id = 0
             if max_user_id:
                 user = await self.uow.users.get_by_max_id(max_user_id)

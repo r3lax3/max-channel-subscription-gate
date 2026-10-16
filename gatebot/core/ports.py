@@ -10,10 +10,14 @@ class Messenger(Protocol):
         """Удалить пользователя из чата. Отсутствие в чате — не ошибка."""
         ...
 
+    async def list_plain_member_ids(self, chat_id: int) -> list[int]:
+        """Участники чата, кроме ботов, владельца и админов."""
+        ...
+
 
 class PaymentLinkFactory(Protocol):
     """Платёжный провайдер (Prodamus)."""
 
     async def create_payment_link(
-        self, order_id: int, amount: int, customer_extra: int, product_name: str
+        self, order_id: int, amount: int, customer_extra: str, product_name: str
     ) -> str: ...

@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.repositories import PaymentRepository, UserRepository
+from db.repositories import BotStateRepository, PaymentRepository, UserRepository
 
 
 class UnitOfWork:
@@ -8,6 +8,7 @@ class UnitOfWork:
         self.session = session
         self.users = UserRepository(session)
         self.payments = PaymentRepository(session)
+        self.state = BotStateRepository(session)
 
     async def commit(self) -> None:
         await self.session.commit()

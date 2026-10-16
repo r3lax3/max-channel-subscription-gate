@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.utils import utcnow
-from db.models import Payment, User
+from db.models import BotState, Payment, User
 
 
 class UserRepository:
@@ -152,3 +152,15 @@ class PaymentRepository:
             .values(status="expired")
         )
         return result.rowcount or 0
+
+
+class BotStateRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get(self, key: str) -> str | None:
+        row = await self.session.get(BotState, key)
+        return row.value if row else None
+
+    async def set(self, key: str, value: str) -> None:
+        await self.session.merge(BotState(key=key, value=value))

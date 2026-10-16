@@ -18,6 +18,7 @@ class FakeMessenger:
         self.sent: list[tuple[int, str]] = []
         self.removed: list[tuple[int, int]] = []
         self.fail_remove_for: set[int] = set()
+        self.members: dict[int, list[int]] = {}
 
     async def send_text(self, user_id: int, text: str) -> None:
         self.sent.append((user_id, text))
@@ -26,6 +27,9 @@ class FakeMessenger:
         if user_id in self.fail_remove_for:
             raise RuntimeError("remove failed")
         self.removed.append((chat_id, user_id))
+
+    async def list_plain_member_ids(self, chat_id: int) -> list[int]:
+        return self.members.get(chat_id, [])
 
 
 class FakeLinks:

@@ -47,3 +47,36 @@ async def test_expires_stale_pending_payments(session_factory, uow, messenger, s
         payments = UnitOfWork(session).payments
         assert (await payments.get_by_order_id(1)).status == "expired"
         assert (await payments.get_by_order_id(2)).status == "pending"
+
+
+async def test_reconcile_disabled_by_default(session_factory, messenger, settings):
+    messenger.members[GROUP_ID] = [77]
+    await run_worker_cycle(session_factory, messenger, settings)
+    assert messenger.removed == []
+
+
+async def test_reconcile_removes_only_strangers(session_factory, uow, messenger, settings):
+    settings.reconcile_members = True
+    await make_user(uow, 40, days_left=10)
+    messenger.members[GROUP_ID] = [40, 77, 1]  # 1 — владелец
+    await run_worker_cycle(session_factory, messenger, settings)
+    assert messenger.removed == [(GROUP_ID, 77)]
+
+
+async def test_kick_failure_alerts_owners(session_factory, uow, messenger, settings):
+    await make_user(uow, 20, days_left=-0.1)
+    messenger.fail_remove_for.add(20)
+    await run_worker_cycle(session_factory, messenger, settings)
+    owner_msgs = [text for uid, text in messenger.sent if uid == 1]
+    assert len(owner_msgs) == 1 and "20" in owner_msgs[0]
+
+
+async def test_failed_reminder_is_not_retried(session_factory, uow, messenger, settings):
+    await make_user(uow, 10, days_left=2)
+
+    async def broken(user_id, text):
+        raise RuntimeError("bot stopped")
+
+    messenger.send_text = broken
+    await run_worker_cycle(session_factory, messenger, settings)
+    assert (await _reload(session_factory, 10)).expiring_notice_sent

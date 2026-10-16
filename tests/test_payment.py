@@ -10,7 +10,7 @@ async def test_create_payment_link_stores_pending_payment(uow, links):
     payment = await uow.payments.get_by_order_id(order_id)
     assert payment.status == "pending" and payment.days == 30
     assert link == f"https://pay.test/{order_id}"
-    assert links.calls[0]["customer_extra"] == 10
+    assert links.calls[0]["customer_extra"] == "max:10"
 
 
 async def test_mark_paid_by_order_id(uow, links):
@@ -21,8 +21,14 @@ async def test_mark_paid_by_order_id(uow, links):
 
 async def test_mark_paid_falls_back_to_customer_extra(uow, links):
     order_id, _ = await PaymentService(uow, links).create_payment_link(10, 2000, 30, "x")
-    payment = await PaymentService(uow, links).mark_paid({"customer_extra": "10"})
+    payment = await PaymentService(uow, links).mark_paid({"customer_extra": "max:10"})
     assert payment.id == order_id
+
+
+async def test_mark_paid_ignores_foreign_customer_extra(uow, links):
+    """Голый id — платёж TG-бота с общего аккаунта Prodamus, не наш."""
+    await PaymentService(uow, links).create_payment_link(10, 2000, 30, "x")
+    assert await PaymentService(uow, links).mark_paid({"customer_extra": "10"}) is None
 
 
 async def test_mark_paid_ignores_already_paid(uow, links):

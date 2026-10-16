@@ -42,3 +42,12 @@ class Payment(Base):
 
     def __repr__(self) -> str:
         return f"<Payment(id={self.id}, user={self.user_id}, status={self.status})>"
+
+
+class BotState(Base):
+    """Служебные значения бота (например, marker long polling)."""
+
+    __tablename__ = "bot_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255))

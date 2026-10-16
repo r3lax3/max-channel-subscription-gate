@@ -22,12 +22,13 @@ class ProdamusClient:
         self.domain = settings.prodamus_domain
         self.secret = settings.prodamus_secret_key
         self.bot_link = settings.bot_link
+        self.notification_url = settings.prodamus_notification_url
 
     async def create_payment_link(
         self,
         order_id: int,
         amount: int,
-        customer_extra: int,
+        customer_extra: str,
         product_name: str,
     ) -> str:
         expires_at = utcnow() + timedelta(hours=LINK_EXPIRATION_HOURS)
@@ -49,6 +50,10 @@ class ProdamusClient:
             "paid_content": self.bot_link,
             "sys": "",
         }
+        if self.notification_url:
+            # Вебхук именно этого бота, а не тот, что задан в кабинете Prodamus
+            # (кабинет может быть общим с TG-ботом).
+            params["urlNotification"] = self.notification_url
 
         signature = _create_hmac(params, self.secret)
         params["signature"] = signature
@@ -56,10 +61,13 @@ class ProdamusClient:
         query = _http_build_query(params)
         url = f"https://{self.domain}/?{query}"
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 resp.raise_for_status()
                 payment_link = (await resp.text()).strip()
+        if not payment_link.startswith("https://"):
+            raise RuntimeError(f"Prodamus returned no link: {payment_link[:200]!r}")
 
         logger.info("Payment link created for order %s", order_id)
         return payment_link
