@@ -323,3 +323,67 @@ async def test_lapsed_subscriber_loses_legacy_price(bot, client, uow):
     await make_user(uow, 10, days_left=-0.01, legacy_pricing=True)
     await bot.handle_update(callback(10, "pay"))
     assert "2000" in client.answers[-1]["message"]["text"]
+
+
+def forward(admin, sender):
+    upd = dm(admin, "")
+    upd["message"]["link"] = {"type": "forward", "message": {"mid": "x", "text": "привет"}}
+    if sender is not None:
+        upd["message"]["link"]["sender"] = sender
+    return upd
+
+
+async def test_forward_opens_card_for_unknown_user(bot, client, session_factory):
+    await bot.handle_update(forward(OWNER, user(555, name="Ольга")))
+    card = client.texts_to(OWNER)[-1]
+    assert "555" in card and "Ольга" in card
+    async with session_factory() as session:
+        u = await UnitOfWork(session).users.get_by_max_id(555)
+        assert u is not None and u.username == "u555"
+
+
+async def test_forward_works_from_user_search_prompt(bot, client):
+    await bot.handle_update(callback(OWNER, "adm:users"))
+    assert "Перешлите" in client.answers[-1]["message"]["text"]
+    await bot.handle_update(forward(OWNER, user(556)))
+    assert "556" in client.texts_to(OWNER)[-1]
+
+
+async def test_forward_with_hidden_author_asks_for_id(bot, client, session_factory):
+    await bot.handle_update(forward(OWNER, None))
+    assert "не показал" in client.texts_to(OWNER)[-1]
+    await bot.handle_update(dm(OWNER, "557"))  # дальше можно ввести ID
+    assert "557" in client.texts_to(OWNER)[-1]
+    async with session_factory() as session:
+        assert await UnitOfWork(session).users.count_total() == 0
+
+
+async def test_forward_from_non_owner_is_ignored_as_admin_action(bot, client, session_factory):
+    await bot.handle_update(forward(42, user(558)))
+    async with session_factory() as session:
+        assert await UnitOfWork(session).users.get_by_max_id(558) is None
+
+
+async def test_forward_in_broadcast_mode_is_broadcast_text(bot, client, session_factory):
+    await bot.handle_update(callback(OWNER, "adm:bc"))
+    upd = forward(OWNER, user(559))
+    upd["message"]["body"]["text"] = "Текст рассылки"
+    await bot.handle_update(upd)
+    async with session_factory() as session:
+        assert await UnitOfWork(session).users.get_by_max_id(559) is None
+
+
+async def test_free_access_link_failure_tells_owner(bot, client):
+    original = client.send_message
+
+    async def refuse_560(*, user_id=None, chat_id=None, body):
+        if user_id == 560:
+            raise MaxApiError(403, "chat.denied", "user has not started the bot")
+        return await original(user_id=user_id, chat_id=chat_id, body=body)
+
+    client.send_message = refuse_560
+    await bot.handle_update(forward(OWNER, user(560)))
+    await bot.handle_update(callback(OWNER, "adm:free:560"))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert any("не запускал бота" in t for t in client.texts_to(OWNER))

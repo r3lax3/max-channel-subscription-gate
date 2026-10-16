@@ -196,6 +196,12 @@ class GateBot:
                 await self.send(user_id, ui.admin_menu())
                 return
             state = self.admin_states.get(user_id)
+            forwarded = _forwarded_sender(message)
+            # Пересланное сообщение — самый простой способ открыть карточку человека:
+            # не нужно знать его ID. В режиме рассылки пересылка — это текст рассылки.
+            if forwarded is not None and not (state and state.waiting == "broadcast"):
+                await self.open_forwarded_card(user_id, forwarded)
+                return
             if state and state.waiting and not text.startswith("/start"):
                 await self.on_admin_input(user_id, state, message)
                 return
@@ -415,8 +421,23 @@ class GateBot:
                         texts.ADMIN_FREE_ENABLED if updated.free_access else texts.ADMIN_FREE_DISABLED
                     )
                     if updated.free_access:
-                        self._spawn(self._notify_access(updated))
+                        self._spawn(self._notify_access(updated, admin_id))
             return await self._user_card(uow, target), notification
+
+    async def open_forwarded_card(self, admin_id: int, sender: dict) -> None:
+        state = self.admin_states.setdefault(admin_id, AdminState())
+        max_id = sender.get("user_id")
+        if not isinstance(max_id, int) or isinstance(max_id, bool) or max_id <= 0 or sender.get("is_bot"):
+            state.waiting = "search"
+            await self.send(admin_id, ui.admin_prompt(texts.ADMIN_FORWARD_HIDDEN))
+            return
+        async with self.session_factory() as session:
+            uow = UnitOfWork(session)
+            # Карточку заводим сразу: доступ можно выдать и тому, кто ещё не запускал бота.
+            await uow.users.get_or_create(max_id, sender.get("username"), _first_name(sender))
+            await uow.commit()
+            state.selected_max_id, state.waiting = max_id, None
+            await self.send(admin_id, await self._user_card(uow, max_id))
 
     async def _notify_quietly(self, max_user_id: int, text: str) -> None:
         try:
@@ -424,12 +445,14 @@ class GateBot:
         except Exception:
             logger.info("Could not notify %s", max_user_id, exc_info=True)
 
-    async def _notify_access(self, user: User) -> None:
+    async def _notify_access(self, user: User, admin_id: int | None = None) -> None:
         """Пользователю выдали доступ вручную — присылаем ссылку на клуб."""
         try:
             await self.on_subscription_activated(user)
         except Exception:
             logger.info("Could not send club link to %s", user.max_user_id, exc_info=True)
+            if admin_id is not None:
+                await self._notify_quietly(admin_id, texts.ADMIN_LINK_NOT_SENT)
 
     async def on_admin_input(self, admin_id: int, state: AdminState, message: dict) -> None:
         body = message.get("body") or {}
@@ -482,7 +505,7 @@ class GateBot:
                         if user else texts.ADMIN_REVOKE_FAILED)
                 await self.messenger.send_text(admin_id, done)
                 if user is not None and SubscriptionService.has_active_subscription(user):
-                    self._spawn(self._notify_access(user))
+                    self._spawn(self._notify_access(user, admin_id))
                 await self.send(admin_id, await self._user_card(uow, state.selected_max_id))
 
     async def _user_card(self, uow: UnitOfWork, max_user_id: int) -> dict:
@@ -527,6 +550,15 @@ class GateBot:
 
 
 _INT64_MAX = 2**63 - 1
+
+
+def _forwarded_sender(message: dict) -> dict | None:
+    """Автор пересланного сообщения; {} — переслано, но MAX автора не показал; None — не пересылка."""
+    link = message.get("link")
+    if not isinstance(link, dict) or link.get("type") != "forward":
+        return None
+    sender = link.get("sender")
+    return sender if isinstance(sender, dict) else {}
 
 
 def _parse_max_id(text: str) -> int | None:
