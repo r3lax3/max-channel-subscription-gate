@@ -104,3 +104,61 @@ def test_signature_list_detection_like_php():
 
     form = {f"products[{i}][name]": str(i) for i in (1, 0, 10, 2, 3, 4, 5, 6, 7, 8, 9)}
     assert [p["name"] for p in _unflatten(form)["products"]] == [str(i) for i in range(11)]
+
+
+@pytest_asyncio.fixture
+async def upstream():
+    """Фейковый TG-бот, куда роутер пересылает чужие уведомления."""
+    from aiohttp import web
+
+    received = []
+
+    async def tg_webhook(request):
+        received.append({"body": await request.read(), "sign": request.headers.get("Sign"),
+                         "type": request.headers.get("Content-Type")})
+        return web.Response(text="TG-OK")
+
+    app = web.Application()
+    app.router.add_post("/prodamus/webhook", tg_webhook)
+    server = TestServer(app)
+    await server.start_server()
+    server.received = received
+    yield server
+    await server.close()
+
+
+async def test_router_forwards_foreign_notification_verbatim(client, settings, upstream):
+    settings.prodamus_forward_url = str(upstream.make_url("/prodamus/webhook"))
+    form = {"order_num": "5", "payment_status": "success", "customer_extra": "12345",
+            "products[0][name]": "Подписка"}
+    resp = await client.post("/prodamus/router", data=form, headers={"Sign": "tg-signature"})
+    assert resp.status == 200 and await resp.text() == "TG-OK"
+    sent = upstream.received[0]
+    assert sent["sign"] == "tg-signature"
+    assert b"customer_extra=12345" in sent["body"]
+    assert sent["type"].startswith("application/x-www-form-urlencoded")
+    assert client.activated == []
+
+
+async def test_router_handles_own_notification(client, settings, session_factory, links, upstream):
+    settings.prodamus_forward_url = str(upstream.make_url("/prodamus/webhook"))
+    order_id = await _create_order(session_factory, links)
+    form = {"order_num": str(order_id), "order_id": "9", "payment_status": "success",
+            "sum": "2000.00", "customer_extra": "max:10"}
+    resp = await client.post("/prodamus/router", data=form, headers={"Sign": _create_hmac(form, SECRET)})
+    assert resp.status == 200
+    assert client.activated == [10] and upstream.received == []
+
+
+async def test_router_upstream_down_returns_502(client, settings):
+    settings.prodamus_forward_url = "http://127.0.0.1:9/prodamus/webhook"
+    resp = await client.post("/prodamus/router", data={"customer_extra": "1"}, headers={"Sign": "x"})
+    assert resp.status == 502
+
+
+async def test_router_recognises_own_order_without_customer_extra(client, settings, session_factory, links, upstream):
+    settings.prodamus_forward_url = str(upstream.make_url("/prodamus/webhook"))
+    order_id = await _create_order(session_factory, links)
+    form = {"order_num": str(order_id), "order_id": "9", "payment_status": "success", "sum": "2000"}
+    resp = await client.post("/prodamus/router", data=form, headers={"Sign": _create_hmac(form, SECRET)})
+    assert resp.status == 200 and client.activated == [10] and upstream.received == []

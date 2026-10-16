@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     # Публичный URL вебхука этого бота (https://<домен>/.../prodamus/webhook).
     # Его же нужно добавить в кабинете Prodamus: «Настройки → URL для уведомлений».
     prodamus_notification_url: str = ""
+    # Куда пересылать чужие уведомления, пришедшие на /prodamus/router
+    # (вебхук TG-бота на том же кабинете Prodamus). Пусто — не пересылать.
+    prodamus_forward_url: str = ""
 
     webhook_port: int = 8080
 

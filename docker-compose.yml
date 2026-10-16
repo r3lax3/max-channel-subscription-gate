@@ -38,6 +38,9 @@ services:
       retries: 3
     env_file:
       - .env
+    # Доступ к другим сервисам хоста (TG-бот для пересылки уведомлений Prodamus)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   postgres_data:

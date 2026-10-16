@@ -70,6 +70,11 @@ class PaymentService:
     def is_ours(data: dict) -> bool:
         return str(data.get("customer_extra") or "").startswith(CUSTOMER_EXTRA_PREFIX)
 
+    async def knows_order(self, data: dict) -> bool:
+        """Номер заказа из уведомления (order_num) — наш."""
+        order_id = _parse_int(data.get("order_num"))
+        return order_id is not None and await self.uow.payments.get_by_order_id(order_id) is not None
+
     async def claim_paid(self, data: dict) -> ClaimResult:
         """Находит наш платёж по уведомлению Prodamus и атомарно помечает оплаченным.
 
