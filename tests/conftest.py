@@ -20,7 +20,7 @@ class FakeMessenger:
         self.fail_remove_for: set[int] = set()
         self.members: dict[int, list[int]] = {}
 
-    async def send_text(self, user_id: int, text: str) -> None:
+    async def send_text(self, user_id: int, text: str, renew_button: bool = False) -> None:
         self.sent.append((user_id, text))
 
     async def remove_member(self, chat_id: int, user_id: int) -> None:

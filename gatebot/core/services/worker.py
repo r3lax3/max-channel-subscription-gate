@@ -4,6 +4,7 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import Settings
+from core.notify import alert_owners
 from core.ports import Messenger
 from core.services.subscription import SubscriptionService
 from db.uow import UnitOfWork
@@ -32,7 +33,8 @@ async def run_worker_cycle(
         for max_user_id in expiring_ids:
             try:
                 await messenger.send_text(
-                    max_user_id, SUBSCRIPTION_EXPIRING.format(days=EXPIRING_NOTICE_DAYS)
+                    max_user_id, SUBSCRIPTION_EXPIRING.format(days=EXPIRING_NOTICE_DAYS),
+                    renew_button=True,
                 )
                 notified += 1
             except Exception:
@@ -45,24 +47,28 @@ async def run_worker_cycle(
     kick_failed: list[int] = []
     for max_user_id in expired_ids:
         # Своя транзакция на каждого: блокировка строки держится только на время кика.
-        async with session_factory() as session:
-            result = await SubscriptionService(
-                UnitOfWork(session), messenger, settings
-            ).expire_if_due(max_user_id)
+        try:
+            async with session_factory() as session:
+                result = await SubscriptionService(
+                    UnitOfWork(session), messenger, settings
+                ).expire_if_due(max_user_id)
+        except Exception:
+            logger.exception("Failed to expire subscription of %s", max_user_id)
+            result = False
         if result is False:
             kick_failed.append(max_user_id)
         elif result:
             kicked += 1
             try:
-                await messenger.send_text(max_user_id, SUBSCRIPTION_EXPIRED)
+                await messenger.send_text(max_user_id, SUBSCRIPTION_EXPIRED, renew_button=True)
             except Exception:
                 logger.warning("Failed to send expiry message to %s", max_user_id, exc_info=True)
 
     if kick_failed:
         # Скорее всего бот потерял права админа — без вмешательства человека
         # истёкшие подписчики так и останутся в клубе.
-        await _alert_owners(
-            messenger, settings,
+        await alert_owners(
+            messenger, settings.owner_ids,
             KICK_FAILED_ALERT.format(count=len(kick_failed), ids=", ".join(map(str, kick_failed))),
         )
 
@@ -74,14 +80,6 @@ async def run_worker_cycle(
         "Worker cycle: notified=%d, kicked=%d, expired_payments=%d, strangers=%d",
         notified, kicked, stale, strangers,
     )
-
-
-async def _alert_owners(messenger: Messenger, settings: Settings, text: str) -> None:
-    for owner_id in settings.owner_ids:
-        try:
-            await messenger.send_text(owner_id, text)
-        except Exception:
-            logger.warning("Failed to alert owner %s", owner_id, exc_info=True)
 
 
 async def _remove_strangers(uow: UnitOfWork, messenger: Messenger, settings: Settings) -> int:
@@ -97,7 +95,7 @@ async def _remove_strangers(uow: UnitOfWork, messenger: Messenger, settings: Set
             if max_user_id in settings.owner_ids:
                 continue
             user = await uow.users.get_by_max_id(max_user_id)
-            if SubscriptionService.has_active_subscription(user):
+            if SubscriptionService.has_access(user):
                 continue
             try:
                 await messenger.remove_member(chat_id, max_user_id)

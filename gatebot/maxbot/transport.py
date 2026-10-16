@@ -59,7 +59,9 @@ async def run_polling(
             continue
         updates = data.get("updates") or []
         if updates:
-            await asyncio.gather(*(handle(u) for u in updates))
+            results = await asyncio.gather(*(handle(u) for u in updates), return_exceptions=True)
+            for error in (r for r in results if isinstance(r, Exception)):
+                logger.error("Update handler failed", exc_info=error)
         new_marker = data.get("marker")
         if new_marker is not None and new_marker != marker:
             marker = new_marker
@@ -134,15 +136,20 @@ def add_webhook_route(app: web.Application, secret: str, handle: UpdateHandler) 
 async def keep_webhook_subscription(
     client: MaxClient, url: str, secret: str, update_types: list[str]
 ) -> None:
-    """MAX молча отписывает бота после 8 часов недоставок — периодически переподписываемся."""
+    """Подписка на webhook. При старте оформляем заново всегда — так до MAX
+    доходят новый секрет и список событий. Затем раз в час проверяем: MAX молча
+    отписывает бота после 8 часов недоставок."""
+    subscribed = False
     while True:
         try:
-            subs = await client.get_subscriptions()
-            if not any(s.get("url") == url for s in subs):
+            if not subscribed or not any(s.get("url") == url for s in await client.get_subscriptions()):
                 await client.subscribe(url, secret, update_types)
-                logger.info("Webhook subscription created: %s", url)
+                subscribed = True
+                logger.info("Webhook subscription active: %s", url)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Webhook subscription check failed")
+            await asyncio.sleep(60)
+            continue
         await asyncio.sleep(SUBSCRIPTION_CHECK_SECONDS)

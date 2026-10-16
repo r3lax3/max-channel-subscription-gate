@@ -75,11 +75,12 @@ class MaxClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
         timeout: float = 35,
+        attempts: int = _MAX_ATTEMPTS,
     ) -> dict:
         params = {k: _query_value(v) for k, v in (params or {}).items() if v is not None}
         session = await self._get_session()
         idempotent = method != "POST"
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
+        for attempt in range(1, attempts + 1):
             await self._throttle()
             try:
                 async with session.request(
@@ -92,14 +93,14 @@ class MaxClient:
                 # POST не идемпотентен: повторяем, только если запрос точно не ушёл
                 # (не удалось соединиться), иначе рискуем отправить сообщение дважды.
                 retryable = idempotent or isinstance(exc, aiohttp.ClientConnectorError)
-                if attempt == _MAX_ATTEMPTS or not retryable:
+                if attempt == attempts or not retryable:
                     raise
                 logger.warning("MAX %s %s: network error, retry %d", method, path, attempt)
                 await asyncio.sleep(attempt)
                 continue
 
             retryable = status == 429 or (idempotent and status in _RETRY_STATUSES)
-            if retryable and attempt < _MAX_ATTEMPTS:
+            if retryable and attempt < attempts:
                 logger.warning("MAX %s %s: HTTP %s, retry %d", method, path, status, attempt)
                 await asyncio.sleep(attempt * 2)
                 continue
@@ -191,6 +192,10 @@ class MaxClient:
     async def get_chat(self, chat_id: int) -> dict:
         return await self.request("GET", f"/chats/{chat_id}")
 
+    async def get_my_membership(self, chat_id: int) -> dict:
+        """Членство и права бота в чате (ChatMember)."""
+        return await self.request("GET", f"/chats/{chat_id}/members/me")
+
     async def get_members(self, chat_id: int) -> list[dict]:
         members: list[dict] = []
         marker = None
@@ -204,10 +209,13 @@ class MaxClient:
                 return members
 
     async def remove_member(self, chat_id: int, user_id: int, block: bool = False) -> dict:
+        # Короткий таймаут и мало попыток: вызывается под блокировкой строки
+        # пользователя, а не удавшийся кик воркер повторит через час.
         return self._check_success(
             await self.request(
                 "DELETE", f"/chats/{chat_id}/members",
                 params={"user_id": user_id, "block": block},
+                timeout=10, attempts=2,
             ),
             "remove_member",
         )

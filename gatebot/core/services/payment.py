@@ -40,13 +40,14 @@ class PaymentService:
     ) -> tuple[int, str]:
         user = await self.uow.users.get_or_create(max_user_id)
         await self.uow.commit()
+        user_id = user.id  # после rollback в цикле объект user уже не прочитать
 
         order_id: int | None = None
         for _ in range(_MAX_ORDER_ID_RETRIES):
             candidate = secrets.randbits(62)
             try:
                 await self.uow.payments.create(
-                    Payment(id=candidate, user_id=user.id, amount=amount, days=days, status="pending")
+                    Payment(id=candidate, user_id=user_id, amount=amount, days=days, status="pending")
                 )
                 order_id = candidate
                 break
@@ -74,15 +75,26 @@ class PaymentService:
 
         Не коммитит: вызывающий коммитит вместе с продлением подписки.
         """
+        provider_id = str(data.get("order_id") or "").strip()[:64] or None
         for payment in await self._candidates(data):
-            if not await self.uow.payments.claim_paid(payment.id):
-                logger.info("Payment %s already processed — duplicate notification", payment.id)
-                return ClaimResult(duplicate=True)
             user = await self.uow.users.get_by_id(payment.user_id)
             if user is None:
                 raise LookupError(f"payment {payment.id} has no user")
-            logger.info("Payment %s paid by %s", payment.id, user.max_user_id)
-            return ClaimResult(payment=payment, max_user_id=user.max_user_id)
+            if await self.uow.payments.claim_paid(payment.id, provider_id):
+                logger.info("Payment %s paid by %s", payment.id, user.max_user_id)
+                return ClaimResult(payment=payment, max_user_id=user.max_user_id)
+            if provider_id and payment.provider_order_id and provider_id != payment.provider_order_id:
+                # Ту же ссылку оплатили ещё раз (новый номер оплаты в Prodamus).
+                extra = Payment(
+                    id=secrets.randbits(62), user_id=user.id,
+                    amount=_parse_sum(data.get("sum")) or payment.amount,
+                    days=payment.days, status="success", provider_order_id=provider_id,
+                )
+                if await self.uow.payments.try_create(extra):
+                    logger.info("Repeated payment %s of order %s", provider_id, payment.id)
+                    return ClaimResult(payment=extra, max_user_id=user.max_user_id)
+            logger.info("Payment %s already processed — duplicate notification", payment.id)
+            return ClaimResult(duplicate=True)
         return ClaimResult()
 
     async def _candidates(self, data: dict) -> list[Payment]:

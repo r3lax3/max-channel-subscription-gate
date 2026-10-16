@@ -5,6 +5,7 @@ from aiohttp import web
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import Settings
+from core.notify import alert_owners
 from core.ports import Messenger, PaymentLinkFactory
 from core.services.payment import PaymentService
 from core.services.subscription import SubscriptionService
@@ -34,13 +35,6 @@ def create_webhook_app(
     async def health(request: web.Request) -> web.Response:
         return web.Response(text="OK")
 
-    async def alert_owners(text: str) -> None:
-        for owner_id in settings.owner_ids:
-            try:
-                await messenger.send_text(owner_id, text)
-            except Exception:
-                logger.warning("Failed to alert owner %s", owner_id, exc_info=True)
-
     async def prodamus_webhook(request: web.Request) -> web.Response:
         try:
             form = {k: str(v) for k, v in (await request.post()).items()}
@@ -65,8 +59,12 @@ def create_webhook_app(
                 if claim.payment is None:
                     if not claim.duplicate and PaymentService.is_ours(form):
                         # Деньги пришли, а подписку выдать некому — нужен человек.
-                        logger.error("Unmatched payment notification: %s", form)
-                        await alert_owners(PAYMENT_UNMATCHED_ALERT.format(
+                        logger.error(
+                            "Unmatched payment: order_num=%s order_id=%s sum=%s customer=%s",
+                            form.get("order_num"), form.get("order_id"),
+                            form.get("sum"), form.get("customer_extra"),
+                        )
+                        await alert_owners(messenger, settings.owner_ids, PAYMENT_UNMATCHED_ALERT.format(
                             customer=form.get("customer_extra", "—"),
                             sum=form.get("sum", "—"),
                             order=form.get("order_id", "—"),

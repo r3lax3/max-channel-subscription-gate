@@ -1,3 +1,5 @@
+import pytest
+
 from datetime import timedelta
 
 from core.pricing import TARIFFS, monthly_price, promo_active, tariff_price
@@ -22,3 +24,13 @@ def test_promo_until_with_timezone_is_normalized_to_utc(settings):
     s = Settings(_env_file=None, database_url="x", bot_token="t",
                  legacy_promo_until="2026-08-12T21:00:00+03:00")
     assert s.legacy_promo_until.isoformat() == "2026-08-12T18:00:00"
+
+
+@pytest.mark.parametrize("raw, expected", [("[1, 2]", [1, 2]), ("1,2", [1, 2]), ("", []), (" 5 ", [5])])
+def test_env_lists_accept_json_csv_and_empty(monkeypatch, raw, expected):
+    from core.config import Settings
+
+    monkeypatch.setenv("owner_ids", raw)
+    monkeypatch.setenv("gated_chat_ids", raw)
+    s = Settings(_env_file=None, database_url="x", bot_token="t")
+    assert s.owner_ids == expected and s.gated_chat_ids == expected

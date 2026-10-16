@@ -123,7 +123,11 @@ def verify_webhook_signature(form: dict[str, str], signature: str, key: str) -> 
     """
     if not signature or not key:
         return False
-    expected = _create_hmac(_unflatten(form), key)
+    try:
+        expected = _create_hmac(_unflatten(form), key)
+    except (TypeError, ValueError):
+        # Противоречивые ключи формы (`a` и `a[b]`) — это не Prodamus.
+        return False
     return hmac.compare_digest(expected, signature.strip().lower())
 
 

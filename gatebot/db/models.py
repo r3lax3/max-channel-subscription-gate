@@ -22,6 +22,8 @@ class User(Base):
     expiring_notice_sent: Mapped[bool] = mapped_column(default=False, server_default="false")
     # Право на цену «старичка»; сбрасывается навсегда при разрыве подписки
     legacy_pricing: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Бесплатный доступ в клуб без подписки (выдаёт владелец). Таких не кикают.
+    free_access: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(default=utcnow, server_default=func.now())
 
     payments: Mapped[list["Payment"]] = relationship(back_populates="user")
@@ -38,6 +40,9 @@ class Payment(Base):
     amount: Mapped[int] = mapped_column()
     days: Mapped[int] = mapped_column(default=30, server_default="30")
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    # Номер оплаты в Prodamus (order_id уведомления). Отличает повтор уведомления
+    # от второй реальной оплаты той же ссылки.
+    provider_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow, server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="payments")

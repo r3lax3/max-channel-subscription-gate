@@ -30,7 +30,8 @@ class UserRepository:
         result = await self.session.execute(
             select(User)
             .where(User.max_user_id == max_user_id)
-            .with_for_update()
+            # FOR NO KEY UPDATE: не мешает вставке платежей (FK на users).
+            .with_for_update(key_share=True)
             .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
@@ -85,21 +86,9 @@ class UserRepository:
 
         Одним UPDATE: параллельное продление (сбрасывает флаг) не перетирается.
         """
-        ids = list((await self.session.execute(
-            select(User.id).where(
-                *self._expiring_filter(days_ahead),
-                User.expiring_notice_sent.is_(False),
-            )
-        )).scalars().all())
-        if not ids:
-            return []
         result = await self.session.execute(
             update(User)
-            .where(
-                User.id.in_(ids),
-                *self._expiring_filter(days_ahead),
-                User.expiring_notice_sent.is_(False),
-            )
+            .where(*self._expiring_filter(days_ahead), User.expiring_notice_sent.is_(False))
             .values(expiring_notice_sent=True)
             .returning(User.max_user_id)
         )
@@ -148,14 +137,23 @@ class PaymentRepository:
     async def get_by_order_id(self, order_id: int) -> Payment | None:
         return await self.session.get(Payment, order_id)
 
-    async def claim_paid(self, payment_id: int) -> bool:
-        """Атомарно переводит платёж в success. False — уже был оплачен (повтор вебхука)."""
+    async def claim_paid(self, payment_id: int, provider_order_id: str | None) -> bool:
+        """Атомарно переводит платёж в success. False — уже был оплачен."""
         result = await self.session.execute(
             update(Payment)
             .where(Payment.id == payment_id, Payment.status != "success")
-            .values(status="success")
+            .values(status="success", provider_order_id=provider_order_id)
         )
         return result.rowcount == 1
+
+    async def try_create(self, payment: Payment) -> bool:
+        """Вставка в savepoint. False — нарушена уникальность (такой уже есть)."""
+        try:
+            async with self.session.begin_nested():
+                self.session.add(payment)
+        except IntegrityError:
+            return False
+        return True
 
     async def get_unpaid_by_user_id(self, user_id: int) -> list[Payment]:
         """Неоплаченные платежи пользователя (pending и протухшие), новые первыми."""

@@ -1,8 +1,15 @@
+import json
 import re
 from datetime import datetime, timezone
 
+from typing import Annotated
+
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# Списки в .env можно писать как JSON ([1,2]), через запятую (1,2) или пусто.
+IntList = Annotated[list[int], NoDecode]
+StrList = Annotated[list[str], NoDecode]
 
 
 class Settings(BaseSettings):
@@ -17,7 +24,7 @@ class Settings(BaseSettings):
     database_url: str
     bot_token: str
     # MAX user_id владельцев, которым доступна админка (/admin)
-    owner_ids: list[int] = []
+    owner_ids: IntList = []
 
     support_link: str = ""
     # Ссылка на бота в MAX (https://max.ru/<bot_username>) — возврат после оплаты
@@ -25,10 +32,10 @@ class Settings(BaseSettings):
 
     # Закрытые групповые чаты, куда пускаем только с подпиской. Только группы:
     # удалять подписчиков канала бот в MAX не может (см. docs/adr/0001).
-    gated_chat_ids: list[int] = []
+    gated_chat_ids: IntList = []
     # Ссылки-приглашения, которые бот выдаёт оплатившим. Пусто — бот возьмёт
     # ссылку из настроек чата (Chat.link).
-    invite_links: list[str] = []
+    invite_links: StrList = []
     # Сверять участников закрытых чатов с базой и удалять неоплативших
     # (страховка от пропущенных событий). Включать, когда все свои уже в базе.
     reconcile_members: bool = False
@@ -44,6 +51,18 @@ class Settings(BaseSettings):
     # Окончание акции «успей купить по старой цене». Пусто — акция выключена.
     # Хранится как naive UTC; значение с таймзоной нормализуется.
     legacy_promo_until: datetime | None = None
+
+    @field_validator("owner_ids", "gated_chat_ids", "invite_links", mode="before")
+    @classmethod
+    def _parse_list(cls, value):
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            return []
+        if value.startswith("["):
+            return json.loads(value)
+        return [item.strip() for item in value.split(",") if item.strip()]
 
     @field_validator("legacy_promo_until", mode="before")
     @classmethod

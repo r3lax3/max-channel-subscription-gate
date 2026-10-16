@@ -18,6 +18,7 @@ from core.services.subscription import SubscriptionService
 from core.services.worker import EXPIRING_NOTICE_DAYS
 from db.models import User
 from db.uow import UnitOfWork
+from core.notify import alert_owners
 from maxbot import ui
 from maxbot.client import MaxClient
 from maxbot.messenger import MaxMessenger
@@ -68,6 +69,15 @@ class GateBot:
         return user_id is not None and user_id in self.settings.owner_ids
 
     async def handle_update(self, update: dict) -> None:
+        """Никогда не бросает: одно кривое событие не должно останавливать приём."""
+        try:
+            await self._dispatch(update)
+        except Exception:
+            logger.exception("Failed to handle update %r", str(update)[:500])
+
+    async def _dispatch(self, update: dict) -> None:
+        if not isinstance(update, dict):
+            return
         handler = {
             "bot_started": self.on_bot_started,
             "message_created": self.on_message,
@@ -75,20 +85,17 @@ class GateBot:
             "user_added": self.on_user_added,
             "bot_added": self.on_bot_added,
             "bot_removed": self.on_bot_removed,
-        }.get(update.get("update_type", ""))
+        }.get(str(update.get("update_type")))
         if handler is None:
             return
         # События одного пользователя — строго по очереди (ввод админа, затем
         # нажатие кнопки), разных пользователей — параллельно.
-        key = _update_owner(update)
+        key = str(_update_owner(update))
         lock = self._locks.get(key)
         if lock is None:
             lock = self._locks[key] = asyncio.Lock()
-        try:
-            async with lock:
-                await handler(update)
-        except Exception:
-            logger.exception("Failed to handle %s", update.get("update_type"))
+        async with lock:
+            await handler(update)
 
     # ---------- общее ----------
 
@@ -120,14 +127,15 @@ class GateBot:
         return result
 
     async def _active_screen(self, user: User) -> dict:
+        paid = SubscriptionService.has_active_subscription(user)
         return ui.subscription_active(
-            user.subscription_end_date, await self.invite_links(),
+            user.subscription_end_date if paid else None, await self.invite_links(),
             EXPIRING_NOTICE_DAYS, self.settings.support_link,
         )
 
     async def start_screen(self, uow: UnitOfWork, max_user: dict) -> dict:
         user = await self._register(uow, max_user)
-        if SubscriptionService.has_active_subscription(user):
+        if SubscriptionService.has_access(user):
             return await self._active_screen(user)
         return ui.main_menu(
             user.first_name or "", await self._monthly_price(user), self.settings.support_link
@@ -139,6 +147,26 @@ class GateBot:
     async def on_subscription_activated(self, user: User) -> None:
         """После оплаты — новое сообщение (с уведомлением) со ссылками на клуб."""
         await self.send(user.max_user_id, await self._active_screen(user))
+
+    async def check_setup(self) -> list[str]:
+        """Проверка закрытых чатов: это группы и у бота есть нужные права."""
+        problems = []
+        for chat_id in self.settings.gated_chat_ids:
+            try:
+                chat = await self.client.get_chat(chat_id)
+                me = await self.client.get_my_membership(chat_id)
+            except Exception as exc:
+                problems.append(f"чат {chat_id}: бот не видит чат ({exc}) — он точно в группе?")
+                continue
+            if chat.get("type") != "chat":
+                problems.append(
+                    f"чат {chat_id} — это {chat.get('type')}, а не группа: удалять участников бот не сможет"
+                )
+            if not me.get("is_owner"):
+                missing = {"read_all_messages", "add_remove_members"} - set(me.get("permissions") or [])
+                if missing:
+                    problems.append(f"чат {chat_id}: боту не хватает прав администратора: {', '.join(sorted(missing))}")
+        return problems
 
     # ---------- события пользователя ----------
 
@@ -227,22 +255,33 @@ class GateBot:
         user_id = max_user.get("user_id")
         if user_id is None or max_user.get("is_bot") or self.is_owner(user_id):
             return
-        if self.is_owner(update.get("inviter_id")):
-            logger.info("User %s added to %s by owner — allowed", user_id, chat_id)
-            return
-
         async with self.session_factory() as session:
             uow = UnitOfWork(session)
+            if self.is_owner(update.get("inviter_id")):
+                # Добавил владелец — значит, свой: бесплатный доступ, чтобы ни
+                # проверка входа, ни сверка участников его не выгнали.
+                await uow.users.get_or_create(
+                    user_id, max_user.get("username"), _first_name(max_user)
+                )
+                await uow.commit()
+                await SubscriptionService(uow, self.messenger, self.settings).set_free_access(
+                    user_id, True
+                )
+                logger.info("User %s added to %s by owner — free access", user_id, chat_id)
+                return
             user = await uow.users.get_by_max_id(user_id)
-            if SubscriptionService.has_active_subscription(user):
-                logger.info("User %s joined %s with active subscription", user_id, chat_id)
+            if SubscriptionService.has_access(user):
+                logger.info("User %s joined %s with access", user_id, chat_id)
                 return
         logger.info("User %s joined %s without subscription — removing", user_id, chat_id)
         try:
             await self.messenger.remove_member(chat_id, user_id)
         except Exception:
             logger.exception("Failed to remove stranger %s from %s", user_id, chat_id)
-            await self._alert_owners(texts.STRANGER_KICK_FAILED.format(user_id=user_id))
+            await alert_owners(
+                self.messenger, self.settings.owner_ids,
+                texts.STRANGER_KICK_FAILED.format(user_id=user_id),
+            )
             return
         try:
             await self.messenger.send_text(user_id, texts.JOIN_DENIED)
@@ -266,22 +305,19 @@ class GateBot:
         if update.get("is_channel"):
             note += "\n⚠️ Удалять подписчиков канала бот в MAX не может — закрыть можно только групповой чат."
         logger.info("Bot added to %s %s (%s)", kind, chat_id, title)
-        await self._alert_owners(
-            f"Бота добавили в {kind} «{ui.plain(title)}».\nchat_id: `{chat_id}`\n{note}"
+        await alert_owners(
+            self.messenger, self.settings.owner_ids,
+            f"Бота добавили в {kind} «{ui.plain(title)}».\nchat_id: `{chat_id}`\n{note}",
         )
-
-    async def _alert_owners(self, text: str) -> None:
-        for owner_id in self.settings.owner_ids:
-            try:
-                await self.messenger.send_text(owner_id, text)
-            except Exception:
-                logger.warning("Could not notify owner %s", owner_id, exc_info=True)
 
     async def on_bot_removed(self, update: dict) -> None:
         chat_id = update.get("chat_id")
         logger.warning("Bot removed from chat %s", chat_id)
         if chat_id in self.settings.gated_chat_ids:
-            await self._alert_owners(texts.BOT_REMOVED_FROM_CLUB.format(chat_id=chat_id))
+            await alert_owners(
+                self.messenger, self.settings.owner_ids,
+                texts.BOT_REMOVED_FROM_CLUB.format(chat_id=chat_id),
+            )
 
     # ---------- админка ----------
 
@@ -331,27 +367,54 @@ class GateBot:
                 snap = await StatsService(UnitOfWork(session)).collect()
             return ui.admin_text(texts.ADMIN_STATS.format(**snap.__dict__)), None
 
-        if state.selected_max_id is None:
+        # Действия карточки несут MAX ID в payload: кнопка на старой карточке
+        # действует на «своего» пользователя, а не на последнего открытого.
+        verb, _, raw_id = action.partition(":")
+        target = _parse_max_id(raw_id)
+        if target is None:
             return ui.admin_menu(), texts.ADMIN_USER_NOT_FOUND
-        if action == "extend":
-            state.waiting = "extend"
+        if verb == "extend":
+            state.waiting, state.selected_max_id = "extend", target
             return ui.admin_prompt(texts.ADMIN_EXTEND_PROMPT), None
+        if verb == "revoke":
+            return ui.admin_confirm_revoke(target), None
+        if verb == "card":
+            async with self.session_factory() as session:
+                return await self._user_card(UnitOfWork(session), target), None
 
         async with self.session_factory() as session:
             uow = UnitOfWork(session)
             service = SubscriptionService(uow, self.messenger, self.settings)
+            user = await uow.users.get_by_max_id(target)
             notification = None
-            if action == "revoke":
-                done = await service.revoke(state.selected_max_id)
+            if user is None:
+                notification = texts.ADMIN_USER_NOT_FOUND
+            elif verb == "revoke_yes":
+                done = await service.revoke(target)
                 notification = texts.ADMIN_REVOKE_DONE if done else texts.ADMIN_REVOKE_FAILED
-            elif action == "legacy":
-                user = await uow.users.get_by_max_id(state.selected_max_id)
-                if user is not None:
-                    user = await service.set_legacy_pricing(user.max_user_id, not user.legacy_pricing)
+            elif verb == "legacy":
+                updated = await service.set_legacy_pricing(target, not user.legacy_pricing)
+                notification = (
+                    texts.ADMIN_LEGACY_ENABLED if updated.legacy_pricing else texts.ADMIN_LEGACY_DISABLED
+                )
+            elif verb == "free":
+                updated = await service.set_free_access(target, not user.free_access)
+                if updated is None:
+                    notification = texts.ADMIN_REVOKE_FAILED
+                else:
                     notification = (
-                        texts.ADMIN_LEGACY_ENABLED if user.legacy_pricing else texts.ADMIN_LEGACY_DISABLED
+                        texts.ADMIN_FREE_ENABLED if updated.free_access else texts.ADMIN_FREE_DISABLED
                     )
-            return await self._user_card(uow, state.selected_max_id), notification
+                    if updated.free_access:
+                        self._spawn(self._notify_access(updated))
+            return await self._user_card(uow, target), notification
+
+    async def _notify_access(self, user: User) -> None:
+        """Пользователю выдали доступ вручную — присылаем ссылку на клуб."""
+        try:
+            await self.on_subscription_activated(user)
+        except Exception:
+            logger.info("Could not send club link to %s", user.max_user_id, exc_info=True)
 
     async def on_admin_input(self, admin_id: int, state: AdminState, message: dict) -> None:
         body = message.get("body") or {}
@@ -393,6 +456,8 @@ class GateBot:
                 try:
                     day = datetime.strptime(text, "%Y-%m-%d").date()
                 except ValueError:
+                    day = None
+                if day is None or day.year > 2099:
                     await self.send(admin_id, ui.admin_prompt(texts.ADMIN_EXTEND_BAD_DATE))
                     return
                 service = SubscriptionService(uow, self.messenger, self.settings)
@@ -401,6 +466,8 @@ class GateBot:
                 done = (texts.ADMIN_EXTEND_DONE.format(date=day.strftime("%d.%m.%Y"))
                         if user else texts.ADMIN_REVOKE_FAILED)
                 await self.messenger.send_text(admin_id, done)
+                if user is not None and SubscriptionService.has_active_subscription(user):
+                    self._spawn(self._notify_access(user))
                 await self.send(admin_id, await self._user_card(uow, state.selected_max_id))
 
     async def _user_card(self, uow: UnitOfWork, max_user_id: int) -> dict:
@@ -410,14 +477,15 @@ class GateBot:
         card = texts.ADMIN_USER_CARD.format(
             id=user.id,
             max_user_id=user.max_user_id,
-            first_name=user.first_name or "—",
-            username=f"@{user.username}" if user.username else "—",
+            first_name=ui.plain(user.first_name) or "—",
+            username=f"@{ui.plain(user.username)}" if user.username else "—",
             is_active="да" if SubscriptionService.has_active_subscription(user) else "нет",
+            free_access="да" if user.free_access else "нет",
             legacy_pricing="да" if user.legacy_pricing else "нет",
             subscription_end_date=ui.fmt_date(user.subscription_end_date),
             created_at=ui.fmt_date(user.created_at),
         )
-        return ui.admin_user_card(card, user.legacy_pricing)
+        return ui.admin_user_card(card, user)
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)

@@ -21,6 +21,8 @@ services:
       dockerfile: gatebot/Dockerfile
     container_name: maxgate
     restart: unless-stopped
+    # Время на завершение: дождаться событий, принятых по webhook (до 25 с)
+    stop_grace_period: 40s
     depends_on:
       postgres:
         condition: service_healthy

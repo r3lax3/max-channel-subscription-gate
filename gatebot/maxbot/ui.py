@@ -1,5 +1,5 @@
 """Экраны бота: функции возвращают тело сообщения MAX (NewMessageBody)."""
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import texts
 from core.pricing import TARIFFS, Tariff
@@ -34,8 +34,14 @@ def _support_row(support_link: str) -> list[list[dict]]:
     return [[link(texts.BTN_SUPPORT, support_link)]] if support_link else []
 
 
+MSK = timezone(timedelta(hours=3))
+
+
 def fmt_date(value: datetime | None) -> str:
-    return value.strftime("%d.%m.%Y %H:%M UTC") if value else "—"
+    """naive UTC из БД → московское время."""
+    if value is None:
+        return "—"
+    return value.replace(tzinfo=timezone.utc).astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
 # --- пользователь ---
@@ -84,9 +90,9 @@ def subscription_active(
         for i, url in enumerate(invite_links, 1)
     ) or "Ссылка на клуб скоро появится — напишите в поддержку."
     return screen(
-        texts.SUBSCRIPTION_ACTIVE.format(
+        (texts.SUBSCRIPTION_ACTIVE.format(
             subscription_end=fmt_date(end), invite_links=links, notice_days=notice_days
-        ),
+        ) if end else texts.FREE_ACCESS_ACTIVE.format(invite_links=links)),
         [[cb(texts.BTN_RENEW, "renew")], *_support_row(support_link)],
     )
 
@@ -127,13 +133,22 @@ def admin_prompt(text: str) -> dict:
     return screen(text, [admin_back_row()])
 
 
-def admin_user_card(card: str, legacy_pricing: bool) -> dict:
+def admin_user_card(card: str, user) -> dict:
+    uid = user.max_user_id
     return screen(card, [
-        [cb(texts.BTN_ADMIN_EXTEND, "adm:extend")],
-        [cb(texts.BTN_ADMIN_REVOKE, "adm:revoke")],
-        [cb(texts.BTN_ADMIN_LEGACY_OFF if legacy_pricing else texts.BTN_ADMIN_LEGACY_ON, "adm:legacy")],
+        [cb(texts.BTN_ADMIN_EXTEND, f"adm:extend:{uid}")],
+        [cb(texts.BTN_ADMIN_FREE_OFF if user.free_access else texts.BTN_ADMIN_FREE_ON, f"adm:free:{uid}")],
+        [cb(texts.BTN_ADMIN_LEGACY_OFF if user.legacy_pricing else texts.BTN_ADMIN_LEGACY_ON, f"adm:legacy:{uid}")],
+        [cb(texts.BTN_ADMIN_REVOKE, f"adm:revoke:{uid}")],
         [cb(texts.BTN_ADMIN_FIND_ANOTHER, "adm:users")],
         admin_back_row(),
+    ])
+
+
+def admin_confirm_revoke(max_user_id: int) -> dict:
+    return screen(texts.ADMIN_REVOKE_CONFIRM.format(max_user_id=max_user_id), [
+        [cb(texts.BTN_ADMIN_REVOKE_YES, f"adm:revoke_yes:{max_user_id}")],
+        [cb(texts.BTN_BACK, f"adm:card:{max_user_id}")],
     ])
 
 

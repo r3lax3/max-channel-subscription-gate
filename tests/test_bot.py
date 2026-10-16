@@ -29,8 +29,14 @@ class FakeClient:
         self.answers.append({"id": callback_id, "message": message, "notification": notification})
         return {"success": True}
 
+    chat_type = "chat"
+    permissions = ["read_all_messages", "add_remove_members"]
+
     async def get_chat(self, chat_id):
-        return {"chat_id": chat_id, "title": "Клуб", "link": INVITE}
+        return {"chat_id": chat_id, "title": "Клуб", "link": INVITE, "type": self.chat_type}
+
+    async def get_my_membership(self, chat_id):
+        return {"user_id": 1, "is_admin": True, "is_owner": False, "permissions": self.permissions}
 
     async def remove_member(self, chat_id, user_id, block=False):
         if user_id not in self.members.get(chat_id, []):
@@ -39,7 +45,7 @@ class FakeClient:
         self.removed.append((chat_id, user_id))
         return {"success": True}
 
-    async def request(self, method, path, params=None, json=None, timeout=35):
+    async def request(self, method, path, params=None, json=None, **kwargs):
         chat_id = int(path.split("/")[2])
         uid = int(params["user_ids"])
         return {"members": [{"user_id": uid}] if uid in self.members.get(chat_id, []) else []}
@@ -181,14 +187,16 @@ async def test_admin_extend_and_revoke(bot, client, session_factory):
     await bot.handle_update(callback(OWNER, "adm:create:55"))
     assert "MAX ID: 55" in client.answers[-1]["message"]["text"]
 
-    await bot.handle_update(callback(OWNER, "adm:extend"))
+    await bot.handle_update(callback(OWNER, "adm:extend:55"))
     await bot.handle_update(dm(OWNER, "2099-01-01"))
     async with session_factory() as session:
         u = await UnitOfWork(session).users.get_by_max_id(55)
         # Конец дня по Москве = 20:59:59 UTC
         assert u.is_active and str(u.subscription_end_date) == "2099-01-01 20:59:59"
 
-    await bot.handle_update(callback(OWNER, "adm:revoke"))
+    await bot.handle_update(callback(OWNER, "adm:revoke:55"))
+    assert client.removed == []  # сначала подтверждение
+    await bot.handle_update(callback(OWNER, "adm:revoke_yes:55"))
     assert client.removed == [(GROUP_ID, 55)]
     async with session_factory() as session:
         assert not (await UnitOfWork(session).users.get_by_max_id(55)).is_active
@@ -198,8 +206,10 @@ async def test_admin_bad_date(bot, client, uow):
     await make_user(uow, 55)
     await bot.handle_update(callback(OWNER, "adm:users"))
     await bot.handle_update(dm(OWNER, "55"))
-    await bot.handle_update(callback(OWNER, "adm:extend"))
+    await bot.handle_update(callback(OWNER, "adm:extend:55"))
     await bot.handle_update(dm(OWNER, "завтра"))
+    assert "Не удалось распознать" in client.texts_to(OWNER)[-1]
+    await bot.handle_update(dm(OWNER, "9999-12-31"))
     assert "Не удалось распознать" in client.texts_to(OWNER)[-1]
 
 
@@ -257,3 +267,41 @@ async def test_markup_in_name_is_stripped(bot, client):
     await bot.handle_update({"update_type": "bot_started", "chat_id": 5,
                              "user": user(10, name="*Ann_[x](y)")})
     assert client.sent[-1][1]["text"].startswith("Annxy,")
+
+
+async def test_check_setup_ok(bot):
+    assert await bot.check_setup() == []
+
+
+async def test_check_setup_reports_channel_and_missing_rights(bot, client):
+    client.chat_type = "channel"
+    client.permissions = ["read_all_messages"]
+    problems = await bot.check_setup()
+    assert len(problems) == 2
+
+
+async def test_owner_with_expired_subscription_is_not_kicked(settings, session_factory, uow):
+    from core.services.worker import run_worker_cycle
+    from .conftest import FakeMessenger
+
+    await make_user(uow, OWNER, days_left=-0.1)
+    m = FakeMessenger()
+    await run_worker_cycle(session_factory, m, settings)
+    assert m.removed == []
+    async with session_factory() as session:
+        assert not (await UnitOfWork(session).users.get_by_max_id(OWNER)).is_active
+
+
+async def test_owner_added_member_gets_free_access_and_link(bot, client, session_factory):
+    client.members[GROUP_ID] = [77]
+    await bot.handle_update({"update_type": "user_added", "chat_id": GROUP_ID,
+                             "user": user(77), "inviter_id": OWNER, "is_channel": False})
+    assert client.removed == []
+    await bot.handle_update(dm(77, "/start"))
+    assert INVITE in client.texts_to(77)[-1]
+
+
+async def test_lapsed_subscriber_loses_legacy_price(bot, client, uow):
+    await make_user(uow, 10, days_left=-0.01, legacy_pricing=True)
+    await bot.handle_update(callback(10, "pay"))
+    assert "2000" in client.answers[-1]["message"]["text"]

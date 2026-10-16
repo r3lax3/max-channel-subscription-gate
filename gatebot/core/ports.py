@@ -4,7 +4,9 @@ from typing import Protocol
 class Messenger(Protocol):
     """То, что ядру нужно от мессенджера. Реализуется адаптером MAX."""
 
-    async def send_text(self, user_id: int, text: str) -> None: ...
+    async def send_text(self, user_id: int, text: str, renew_button: bool = False) -> None:
+        """Сообщение в личку; renew_button — с кнопкой «Продлить подписку»."""
+        ...
 
     async def remove_member(self, chat_id: int, user_id: int) -> None:
         """Удалить пользователя из чата. Отсутствие в чате — не ошибка."""

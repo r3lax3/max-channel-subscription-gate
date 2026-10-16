@@ -7,6 +7,7 @@ from aiohttp import web
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from core.config import Settings
+from core.notify import alert_owners
 from core.services.worker import subscription_worker
 from core.utils import setup_logging
 from infrastructure.prodamus import ProdamusClient
@@ -23,20 +24,31 @@ BOT_COMMANDS = [
 ]
 
 
-async def announce(client: MaxClient, settings: Settings) -> None:
-    """Проверка токена и команды бота. Ретраим в фоне: недоступность MAX
-    не должна мешать приёму оплат (HTTP-сервер уже работает)."""
+async def announce(client: MaxClient, bot: GateBot, settings: Settings) -> None:
+    """Проверка токена, команды бота и настроек закрытых чатов. Ретраим в фоне:
+    недоступность MAX не должна мешать приёму оплат (HTTP-сервер уже работает).
+    Никогда не завершается ошибкой."""
     while True:
         try:
             me = await client.get_me()
             logger.info("Bot @%s (user_id=%s) is up", me.get("username"), me.get("user_id"))
             await client.set_commands(BOT_COMMANDS)
-            return
+            break
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("MAX API is unavailable, retrying in 30s")
             await asyncio.sleep(30)
+    try:
+        if problems := await bot.check_setup():
+            for problem in problems:
+                logger.error("Setup: %s", problem)
+            await alert_owners(
+                bot.messenger, settings.owner_ids,
+                "⚠️ Проблемы с настройкой клуба:\n" + "\n".join(f"• {p}" for p in problems),
+            )
+    except Exception:
+        logger.exception("Setup check failed")
 
 
 async def main() -> int:
@@ -59,10 +71,7 @@ async def main() -> int:
     app = create_webhook_app(
         settings, session_factory, bot.messenger, bot.links, bot.on_subscription_activated
     )
-    jobs = [
-        announce(client, settings),
-        subscription_worker(session_factory, bot.messenger, settings),
-    ]
+    jobs = [subscription_worker(session_factory, bot.messenger, settings)]
     if settings.max_webhook_url:
         add_webhook_route(app, settings.max_webhook_secret, bot.handle_update)
         jobs.append(keep_webhook_subscription(
@@ -82,19 +91,17 @@ async def main() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    # Фоновые задачи бесконечны: завершение любой из них — авария, выходим
+    # с ошибкой, docker перезапустит контейнер.
     tasks = [asyncio.create_task(job) for job in jobs]
-    announce_task = tasks[0]
+    announcer = asyncio.create_task(announce(client, bot, settings))
     stopper = asyncio.create_task(stop.wait())
+    done, pending = await asyncio.wait({stopper, *tasks}, return_when=asyncio.FIRST_COMPLETED)
     exit_code = 0
-    pending = {stopper, *tasks}
-    while not stop.is_set():
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        crashed = [t for t in done if t is not stopper and not (t is announce_task and not t.exception())]
-        if crashed:
-            for task in crashed:
-                logger.error("Background job stopped", exc_info=task.exception())
-            exit_code = 1
-            break
+    for task in done - {stopper}:
+        logger.error("Background job stopped", exc_info=task.exception())
+        exit_code = 1
+    pending.add(announcer)
 
     logger.info("Shutting down")
     for task in pending:
