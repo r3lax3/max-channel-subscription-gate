@@ -1,0 +1,53 @@
+from datetime import datetime, timezone
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    debug: bool = False
+
+    database_url: str
+    bot_token: str
+    # MAX user_id владельцев, которым доступна админка (/admin)
+    owner_ids: list[int] = []
+
+    support_link: str = ""
+    # Ссылка на бота в MAX (https://max.ru/<bot_username>) — возврат после оплаты
+    bot_link: str = ""
+
+    # Закрытые чаты (группа и/или канал), куда пускаем только с подпиской
+    gated_chat_ids: list[int] = []
+
+    # Базовая цена руб/месяц; цены тарифов (квартал, полгода) считаются от неё
+    subscription_price: int = 2000
+    # Цена для «старичков» — непрерывная подписка, оплаченная до даты отсечки
+    subscription_price_legacy: int = 1500
+    # Окончание акции «успей купить по старой цене». Пусто — акция выключена.
+    # Хранится как naive UTC; значение с таймзоной нормализуется.
+    legacy_promo_until: datetime | None = None
+
+    @field_validator("legacy_promo_until", mode="before")
+    @classmethod
+    def _empty_promo_until_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("legacy_promo_until", mode="after")
+    @classmethod
+    def _promo_until_to_naive_utc(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    prodamus_domain: str = ""
+    prodamus_secret_key: str = ""
+
+    webhook_port: int = 8080
