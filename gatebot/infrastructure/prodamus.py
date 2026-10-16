@@ -3,7 +3,9 @@ import hmac
 import json
 import logging
 from datetime import timedelta
-from urllib.parse import quote
+from email import policy as email_policy
+from email.parser import BytesParser
+from urllib.parse import parse_qsl, quote
 
 import aiohttp
 
@@ -112,6 +114,26 @@ def _http_build_query(data: dict, prefix: str = "") -> str:
         else:
             parts.append(f"{quote(full_key)}={quote(str(value))}")
     return "&".join(parts)
+
+
+def parse_form_body(body: bytes, content_type: str) -> dict[str, str]:
+    """Разбор тела уведомления (multipart/form-data или urlencoded) из байтов.
+
+    Нужен там, где сырое тело уже прочитано (маршрутизатор пересылает его
+    дальше как есть) и aiohttp второй раз multipart не разберёт.
+    """
+    if content_type.lower().startswith("multipart/"):
+        message = BytesParser(policy=email_policy.HTTP).parsebytes(
+            b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + body
+        )
+        form: dict[str, str] = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name is not None:
+                payload = part.get_payload(decode=True) or b""
+                form[str(name)] = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        return form
+    return dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
 
 
 def verify_webhook_signature(form: dict[str, str], signature: str, key: str) -> bool:

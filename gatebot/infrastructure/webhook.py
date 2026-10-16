@@ -12,7 +12,7 @@ from core.services.payment import PaymentService
 from core.services.subscription import SubscriptionService
 from db.models import User
 from db.uow import UnitOfWork
-from infrastructure.prodamus import verify_webhook_signature
+from infrastructure.prodamus import parse_form_body, verify_webhook_signature
 from texts import PAYMENT_UNMATCHED_ALERT
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,11 @@ def create_webhook_app(
         Так URL в кабинете Prodamus менять не нужно (docs/adr/0004).
         """
         raw = await request.read()
-        form = await read_form(request)
+        try:
+            form = parse_form_body(raw, request.headers.get("Content-Type", ""))
+        except Exception:
+            logger.exception("Router: failed to parse body")
+            form = None
         if form is not None and await is_ours(form):
             return await handle_payment(request, form)
         if not settings.prodamus_forward_url:

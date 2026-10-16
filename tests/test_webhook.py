@@ -6,7 +6,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from core.services.payment import PaymentService
 from core.utils import utcnow
 from db.uow import UnitOfWork
-from infrastructure.prodamus import _create_hmac, verify_webhook_signature
+from infrastructure.prodamus import _create_hmac, _unflatten, verify_webhook_signature
 from infrastructure.webhook import create_webhook_app
 
 SECRET = "test_secret"
@@ -162,3 +162,52 @@ async def test_router_recognises_own_order_without_customer_extra(client, settin
     form = {"order_num": str(order_id), "order_id": "9", "payment_status": "success", "sum": "2000"}
     resp = await client.post("/prodamus/router", data=form, headers={"Sign": _create_hmac(form, SECRET)})
     assert resp.status == 200 and client.activated == [10] and upstream.received == []
+
+
+def _multipart(form: dict[str, str]):
+    """Как шлёт Prodamus: multipart/form-data."""
+    import aiohttp
+
+    writer = aiohttp.MultipartWriter("form-data")
+    for key, value in form.items():
+        part = writer.append(value)
+        part.set_content_disposition("form-data", name=key)
+    return writer
+
+
+async def test_router_handles_own_multipart_notification(client, settings, session_factory, links, upstream):
+    settings.prodamus_forward_url = str(upstream.make_url("/prodamus/webhook"))
+    order_id = await _create_order(session_factory, links)
+    form = {"order_num": str(order_id), "order_id": "9", "payment_status": "success",
+            "sum": "2000.00", "customer_extra": "max:10", "products[0][name]": "Подписка — месяц"}
+    resp = await client.post("/prodamus/router", data=_multipart(form),
+                             headers={"Sign": _create_hmac(_unflatten(form), SECRET)})
+    assert resp.status == 200
+    assert client.activated == [10] and upstream.received == []
+
+
+async def test_router_forwards_foreign_multipart_verbatim(client, settings, upstream):
+    settings.prodamus_forward_url = str(upstream.make_url("/prodamus/webhook"))
+    resp = await client.post("/prodamus/router", data=_multipart({"customer_extra": "12345"}),
+                             headers={"Sign": "tg"})
+    assert resp.status == 200
+    sent = upstream.received[0]
+    assert sent["type"].startswith("multipart/form-data") and b"12345" in sent["body"]
+
+
+def test_parse_form_body_urlencoded_and_multipart():
+    from infrastructure.prodamus import parse_form_body
+
+    assert parse_form_body(b"a=1&b=&c=%D1%8F", "application/x-www-form-urlencoded") == {"a": "1", "b": "", "c": "я"}
+    body = (b"--XX\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\n\xd0\xb7\r\n"
+            b"--XX\r\nContent-Disposition: form-data; name=\"e\"\r\n\r\n\r\n--XX--\r\n")
+    assert parse_form_body(body, "multipart/form-data; boundary=XX") == {"k": "з", "e": ""}
+
+
+async def test_direct_webhook_accepts_multipart(client, session_factory, links):
+    order_id = await _create_order(session_factory, links)
+    form = {"order_num": str(order_id), "order_id": "9", "payment_status": "success",
+            "sum": "2000.00", "customer_extra": "max:10"}
+    resp = await client.post("/prodamus/webhook", data=_multipart(form),
+                             headers={"Sign": _create_hmac(form, SECRET)})
+    assert resp.status == 200 and client.activated == [10]
