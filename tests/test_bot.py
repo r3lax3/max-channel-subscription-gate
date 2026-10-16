@@ -292,13 +292,31 @@ async def test_owner_with_expired_subscription_is_not_kicked(settings, session_f
         assert not (await UnitOfWork(session).users.get_by_max_id(OWNER)).is_active
 
 
-async def test_owner_added_member_gets_free_access_and_link(bot, client, session_factory):
+async def test_owner_added_member_is_kept_and_owner_decides(bot, client, session_factory):
     client.members[GROUP_ID] = [77]
     await bot.handle_update({"update_type": "user_added", "chat_id": GROUP_ID,
                              "user": user(77), "inviter_id": OWNER, "is_channel": False})
+    await asyncio.gather(*bot._background)
     assert client.removed == []
-    await bot.handle_update(dm(77, "/start"))
+    owner_body = client.sent[-1][1]
+    assert client.sent[-1][0] == OWNER and "77" in owner_body["text"]
+    async with session_factory() as session:
+        assert not (await UnitOfWork(session).users.get_by_max_id(77)).free_access
+
+    await bot.handle_update(callback(OWNER, "adm:free:77"))
+    await asyncio.gather(*bot._background)
     assert INVITE in client.texts_to(77)[-1]
+
+
+async def test_free_access_user_not_told_access_closed(settings, session_factory, uow):
+    from core.services.worker import run_worker_cycle
+    from texts import SUBSCRIPTION_EXPIRED
+    from .conftest import FakeMessenger
+
+    await make_user(uow, 88, days_left=-0.1, free_access=True)
+    m = FakeMessenger()
+    await run_worker_cycle(session_factory, m, settings)
+    assert m.removed == [] and (88, SUBSCRIPTION_EXPIRED) not in m.sent
 
 
 async def test_lapsed_subscriber_loses_legacy_price(bot, client, uow):

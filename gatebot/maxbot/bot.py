@@ -10,15 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import texts
 from core.config import Settings
+from core.notify import alert_owners
 from core.ports import PaymentLinkFactory
 from core.pricing import TARIFFS, monthly_price, tariff_price
 from core.services.payment import PaymentService
 from core.services.stats import StatsService
 from core.services.subscription import SubscriptionService
 from core.services.worker import EXPIRING_NOTICE_DAYS
+from core.utils import fmt_msk
 from db.models import User
 from db.uow import UnitOfWork
-from core.notify import alert_owners
 from maxbot import ui
 from maxbot.client import MaxClient
 from maxbot.messenger import MaxMessenger
@@ -257,21 +258,19 @@ class GateBot:
             return
         async with self.session_factory() as session:
             uow = UnitOfWork(session)
+            user = await uow.users.get_by_max_id(user_id)
+            if SubscriptionService.has_access(user):
+                logger.info("User %s joined %s with access", user_id, chat_id)
+                return
             if self.is_owner(update.get("inviter_id")):
-                # Добавил владелец — значит, свой: бесплатный доступ, чтобы ни
-                # проверка входа, ни сверка участников его не выгнали.
+                # Добавил владелец — не удаляем, но и доступ навсегда сами не
+                # выдаём: решает владелец кнопкой в уведомлении.
                 await uow.users.get_or_create(
                     user_id, max_user.get("username"), _first_name(max_user)
                 )
                 await uow.commit()
-                await SubscriptionService(uow, self.messenger, self.settings).set_free_access(
-                    user_id, True
-                )
-                logger.info("User %s added to %s by owner — free access", user_id, chat_id)
-                return
-            user = await uow.users.get_by_max_id(user_id)
-            if SubscriptionService.has_access(user):
-                logger.info("User %s joined %s with access", user_id, chat_id)
+                logger.info("User %s added to %s by owner without access", user_id, chat_id)
+                self._spawn(self._ask_owners_about(user_id, max_user))
                 return
         logger.info("User %s joined %s without subscription — removing", user_id, chat_id)
         try:
@@ -288,6 +287,14 @@ class GateBot:
         except Exception:
             # Человек мог ни разу не запускать бота — написать ему нельзя.
             logger.info("Could not DM %s about denied join", user_id)
+
+    async def _ask_owners_about(self, user_id: int, max_user: dict) -> None:
+        body = ui.owner_added_member(user_id, ui.plain(_first_name(max_user)))
+        for owner_id in self.settings.owner_ids:
+            try:
+                await self.send(owner_id, body)
+            except Exception:
+                logger.warning("Failed to ask owner %s about %s", owner_id, user_id, exc_info=True)
 
     async def on_bot_added(self, update: dict) -> None:
         chat_id = update.get("chat_id")
@@ -392,6 +399,8 @@ class GateBot:
             elif verb == "revoke_yes":
                 done = await service.revoke(target)
                 notification = texts.ADMIN_REVOKE_DONE if done else texts.ADMIN_REVOKE_FAILED
+                if done and not self.is_owner(target):
+                    self._spawn(self._notify_quietly(target, texts.SUBSCRIPTION_REVOKED))
             elif verb == "legacy":
                 updated = await service.set_legacy_pricing(target, not user.legacy_pricing)
                 notification = (
@@ -408,6 +417,12 @@ class GateBot:
                     if updated.free_access:
                         self._spawn(self._notify_access(updated))
             return await self._user_card(uow, target), notification
+
+    async def _notify_quietly(self, max_user_id: int, text: str) -> None:
+        try:
+            await self.messenger.send_text(max_user_id, text)
+        except Exception:
+            logger.info("Could not notify %s", max_user_id, exc_info=True)
 
     async def _notify_access(self, user: User) -> None:
         """Пользователю выдали доступ вручную — присылаем ссылку на клуб."""
@@ -482,8 +497,8 @@ class GateBot:
             is_active="да" if SubscriptionService.has_active_subscription(user) else "нет",
             free_access="да" if user.free_access else "нет",
             legacy_pricing="да" if user.legacy_pricing else "нет",
-            subscription_end_date=ui.fmt_date(user.subscription_end_date),
-            created_at=ui.fmt_date(user.created_at),
+            subscription_end_date=fmt_msk(user.subscription_end_date),
+            created_at=fmt_msk(user.created_at),
         )
         return ui.admin_user_card(card, user)
 

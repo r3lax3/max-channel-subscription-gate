@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -81,7 +81,7 @@ class UserRepository:
             User.subscription_end_date <= now + timedelta(days=days_ahead),
         )
 
-    async def claim_expiring_notices(self, days_ahead: int) -> list[int]:
+    async def claim_expiring_notices(self, days_ahead: int) -> list[tuple[int, datetime]]:
         """Помечает «напоминание отправлено» у истекающих и возвращает их MAX ID.
 
         Одним UPDATE: параллельное продление (сбрасывает флаг) не перетирается.
@@ -90,9 +90,9 @@ class UserRepository:
             update(User)
             .where(*self._expiring_filter(days_ahead), User.expiring_notice_sent.is_(False))
             .values(expiring_notice_sent=True)
-            .returning(User.max_user_id)
+            .returning(User.max_user_id, User.subscription_end_date)
         )
-        return list(result.scalars().all())
+        return [(row[0], row[1]) for row in result.all()]
 
     async def get_expired_ids(self) -> list[int]:
         result = await self.session.execute(
@@ -114,6 +114,17 @@ class UserRepository:
                 User.is_active.is_(True),
                 User.subscription_end_date.isnot(None),
                 User.subscription_end_date > utcnow(),
+            )
+        )
+        return int(result.scalar_one() or 0)
+
+    async def count_free_access_only(self) -> int:
+        """Бесплатный доступ без действующей оплаченной подписки."""
+        now = utcnow()
+        result = await self.session.execute(
+            select(func.count(User.id)).where(
+                User.free_access.is_(True),
+                ~(User.is_active.is_(True) & (User.subscription_end_date > now)),
             )
         )
         return int(result.scalar_one() or 0)

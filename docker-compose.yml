@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: maxgate
+      # Меняете пароль — поменяйте и database_url в .env
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-maxgate}
       POSTGRES_DB: maxgate
     volumes:
@@ -27,8 +28,14 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      # 8080 на VPS занят TG-ботом
-      - "8081:8080"
+      # Только для reverse proxy на этой же машине (nginx → 127.0.0.1:8081).
+      # Внутри контейнера порт всегда 8080 — webhook_port в .env не меняйте.
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     env_file:
       - .env
 

@@ -134,14 +134,16 @@ async def test_poison_update_kills_polling(settings, session_factory, links):
         await run_polling(pc, gb.handle_update, session_factory, [])
 
 
-# BUG 5 (medium, when reconcile_members=True): on_user_added explicitly allows people the
-# owner added by hand, but the worker's _remove_strangers removes everyone without an active
-# subscription -> the owner's guest is kicked within an hour. Policies contradict.
-async def test_reconcile_kicks_member_added_by_owner(bot, client, settings, session_factory):
+# BUG 5 (medium, when reconcile_members=True): on_user_added let people added by an owner
+# stay, but reconcile then removed them within an hour. Policy now: the owner is asked and
+# grants free access explicitly; with it, reconcile keeps the member.
+async def test_reconcile_keeps_member_owner_granted_free_access(bot, client, settings, session_factory):
     settings.reconcile_members = True
     await bot.handle_update({"update_type": "user_added", "chat_id": GROUP_ID,
                              "user": user(77), "inviter_id": OWNER})
     assert client.removed == []
+    await bot.handle_update(callback(OWNER, "adm:free:77"))
+    await asyncio.gather(*bot._background)
     m = FakeMessenger()
     m.members[GROUP_ID] = [77]
     await run_worker_cycle(session_factory, m, settings)

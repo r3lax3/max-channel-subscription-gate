@@ -1,8 +1,9 @@
 """Экраны бота: функции возвращают тело сообщения MAX (NewMessageBody)."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import texts
 from core.pricing import TARIFFS, Tariff
+from core.utils import fmt_msk
 
 
 MAX_TEXT_LENGTH = 4000
@@ -34,14 +35,6 @@ def _support_row(support_link: str) -> list[list[dict]]:
     return [[link(texts.BTN_SUPPORT, support_link)]] if support_link else []
 
 
-MSK = timezone(timedelta(hours=3))
-
-
-def fmt_date(value: datetime | None) -> str:
-    """naive UTC из БД → московское время."""
-    if value is None:
-        return "—"
-    return value.replace(tzinfo=timezone.utc).astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
 # --- пользователь ---
@@ -91,9 +84,10 @@ def subscription_active(
     ) or "Ссылка на клуб скоро появится — напишите в поддержку."
     return screen(
         (texts.SUBSCRIPTION_ACTIVE.format(
-            subscription_end=fmt_date(end), invite_links=links, notice_days=notice_days
+            subscription_end=fmt_msk(end), invite_links=links, notice_days=notice_days
         ) if end else texts.FREE_ACCESS_ACTIVE.format(invite_links=links)),
-        [[cb(texts.BTN_RENEW, "renew")], *_support_row(support_link)],
+        # Бесплатный доступ продлевать нечего.
+        [*([[cb(texts.BTN_RENEW, "renew")]] if end else []), *_support_row(support_link)],
     )
 
 
@@ -157,6 +151,13 @@ def admin_user_missing(max_id: int) -> dict:
         [cb(texts.BTN_ADMIN_CREATE, f"adm:create:{max_id}")],
         [cb(texts.BTN_ADMIN_FIND_ANOTHER, "adm:users")],
         admin_back_row(),
+    ])
+
+
+def owner_added_member(max_user_id: int, name: str) -> dict:
+    return screen(texts.OWNER_ADDED_MEMBER.format(name=name or "—", max_user_id=max_user_id), [
+        [cb(texts.BTN_ADMIN_FREE_ON, f"adm:free:{max_user_id}")],
+        [cb(texts.BTN_ADMIN_OPEN_CARD, f"adm:card:{max_user_id}")],
     ])
 
 

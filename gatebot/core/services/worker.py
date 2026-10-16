@@ -7,6 +7,7 @@ from core.config import Settings
 from core.notify import alert_owners
 from core.ports import Messenger
 from core.services.subscription import SubscriptionService
+from core.utils import fmt_msk
 from db.uow import UnitOfWork
 from texts import KICK_FAILED_ALERT, SUBSCRIPTION_EXPIRED, SUBSCRIPTION_EXPIRING
 
@@ -27,13 +28,13 @@ async def run_worker_cycle(
         uow = UnitOfWork(session)
         # Флаг ставим до отправки и при ошибке не снимаем: человек мог остановить
         # бота, и без флага мы бы писали ему каждый час до конца подписки.
-        expiring_ids = await uow.users.claim_expiring_notices(EXPIRING_NOTICE_DAYS)
+        expiring = await uow.users.claim_expiring_notices(EXPIRING_NOTICE_DAYS)
         await uow.commit()
         notified = 0
-        for max_user_id in expiring_ids:
+        for max_user_id, end in expiring:
             try:
                 await messenger.send_text(
-                    max_user_id, SUBSCRIPTION_EXPIRING.format(days=EXPIRING_NOTICE_DAYS),
+                    max_user_id, SUBSCRIPTION_EXPIRING.format(end=fmt_msk(end)),
                     renew_button=True,
                 )
                 notified += 1
@@ -59,6 +60,12 @@ async def run_worker_cycle(
             kick_failed.append(max_user_id)
         elif result:
             kicked += 1
+            async with session_factory() as session:
+                renewed = SubscriptionService.has_active_subscription(
+                    await UnitOfWork(session).users.get_by_max_id(max_user_id)
+                )
+            if renewed:
+                continue  # оплата пришла во время кика — ссылку бот уже прислал
             try:
                 await messenger.send_text(max_user_id, SUBSCRIPTION_EXPIRED, renew_button=True)
             except Exception:

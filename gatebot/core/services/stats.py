@@ -7,6 +7,7 @@ from db.uow import UnitOfWork
 class StatsSnapshot:
     total_users: int
     active_subscribers: int
+    free_access: int
     inactive_users: int
     expiring_soon: int
     paid_count: int
@@ -22,10 +23,12 @@ class StatsService:
     async def collect(self) -> StatsSnapshot:
         total = await self.uow.users.count_total()
         active = await self.uow.users.count_active_subscribers()
+        free = await self.uow.users.count_free_access_only()
         return StatsSnapshot(
             total_users=total,
             active_subscribers=active,
-            inactive_users=total - active,
+            free_access=free,
+            inactive_users=total - active - free,
             expiring_soon=await self.uow.users.count_expiring_within(7),
             paid_count=await self.uow.payments.count_by_status("success"),
             pending_count=await self.uow.payments.count_by_status("pending"),

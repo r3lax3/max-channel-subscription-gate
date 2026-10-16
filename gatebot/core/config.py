@@ -19,8 +19,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    debug: bool = False
-
     database_url: str
     bot_token: str
     # MAX user_id владельцев, которым доступна админка (/admin)

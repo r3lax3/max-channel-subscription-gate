@@ -16,7 +16,7 @@ class Tariff:
 TARIFFS: tuple[Tariff, ...] = (
     Tariff(months=1, days=30, discount_percent=0, title="Месяц"),
     Tariff(months=3, days=90, discount_percent=10, title="Квартал"),
-    Tariff(months=6, days=180, discount_percent=15, title="Пол года"),
+    Tariff(months=6, days=180, discount_percent=15, title="Полгода"),
 )
 
 

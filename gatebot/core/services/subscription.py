@@ -96,14 +96,20 @@ class SubscriptionService:
         """Кикает и деактивирует пользователя, если подписка всё ещё истекла.
 
         Проверка идёт под блокировкой: оплата, пришедшая во время кика, ждёт
-        и затем продлевает подписку поверх. None — уже не истекла (продлили),
-        False — кик не удался (состояние не тронуто, повторим позже), True — готово.
+        и затем продлевает подписку поверх. None — удалять не нужно (продлили,
+        владелец или бесплатный доступ), False — кик не удался (состояние не
+        тронуто, повторим позже), True — удалён.
         """
         user = await self.uow.users.lock(max_user_id)
         if user is None or not user.is_active or self.has_active_subscription(user):
             await self.uow.rollback()
             return None
-        if not self._exempt_from_kick(user) and not await self.kick(max_user_id):
+        if self._exempt_from_kick(user):
+            # Владелец или бесплатный доступ: срок кончился, но в клубе остаётся.
+            self._break(user)
+            await self.uow.commit()
+            return None
+        if not await self.kick(max_user_id):
             await self.uow.rollback()
             return False
         self._break(user)
