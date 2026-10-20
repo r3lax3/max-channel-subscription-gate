@@ -72,7 +72,6 @@ class ProdamusClient:
         if not payment_link.startswith("https://"):
             raise RuntimeError(f"Prodamus returned no link: {payment_link[:200]!r}")
 
-        logger.info("Payment link created for order %s", order_id)
         return payment_link
 
 

@@ -63,7 +63,7 @@ class PaymentService:
             customer_extra=f"{CUSTOMER_EXTRA_PREFIX}{max_user_id}",
             product_name=product_name,
         )
-        logger.info("Payment link created for %s, order %s", max_user_id, order_id)
+        logger.info("Payment link created for %s, order %s: %s", max_user_id, order_id, link)
         return order_id, link
 
     @staticmethod
